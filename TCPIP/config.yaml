@@ -1,0 +1,32 @@
+tcp:
+  host: "0.0.0.0"        # IP address of the TCP server,local PC, Not HOLOLENS!!!!!
+  port: 8848                   # Port number for the TCP connection
+
+saving:
+  output_dir: "guiji_qingyi_3" # Directory where output data will be saved
+
+skeleton:
+  use_dual_camera: false       # Whether to use dual cameras for skeleton tracking
+  T_M:                         # Transformation matrix (e.g., from camera to world coordinate system)
+    [[1, 0, 0, 0],
+     [0, -1, 0, 0],
+     [0, 0, -1, 0],
+     [0, 0, 0, 1]]
+
+pointcloud:
+  max_points: 8000             # Maximum number of points in the point cloud
+  ero_para: 1                  # Erosion parameter used in point cloud filtering
+  use_dual_camera: false       # Whether to use dual cameras for point cloud generation
+
+alignment:
+  aruco_path: "ROS_points.txt"
+                                # Path to the ArUco calibration file (used for camera pose estimation)
+  tm_cache_file: 'tm_matrix.txt'
+  stereo_transform_path: "D:/Documents/MasterThesis/Tongli_Zhu_MSc/AR-MoCap/02_Code/02_PC/Python/PythonProject/Matlab/T_icp_updated.txt"
+                                # Path to the stereo transformation matrix (T_Stereo), used to align both camera views
+
+robot:
+  position_file: "robotPosition.txt" # File containing robot position data
+
+recording:
+  output_file: "calibration_data_recorded.txt" # File to save recorded calibration data

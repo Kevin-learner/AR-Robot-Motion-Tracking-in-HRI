@@ -1,0 +1,95 @@
+---
+# Point 1 (P_robot_1)
+header: 
+  seq: 142
+  stamp: 
+    secs: 1678932001
+    nsecs: 450000000
+  frame_id: "base_link"
+child_frame_id: "tool0_tcp"
+transform: 
+  translation: 
+    x: 0.4976
+    y: 0.2600
+    z: 0.2341
+  rotation: 
+    x: 0.0000
+    y: 0.7071
+    z: 0.0000
+    w: 0.7071
+---
+# Point 2 (P_robot_2)
+header: 
+  seq: 143
+  stamp: 
+    secs: 1678932005
+    nsecs: 120000000
+  frame_id: "base_link"
+child_frame_id: "tool0_tcp"
+transform: 
+  translation: 
+    x: 0.3443
+    y: 0.3938
+    z: 0.2458
+  rotation: 
+    x: 0.0000
+    y: 0.7071
+    z: 0.0000
+    w: 0.7071
+---
+# Point 3 (P_robot_3)
+header: 
+  seq: 144
+  stamp: 
+    secs: 1678932010
+    nsecs: 890000000
+  frame_id: "base_link"
+child_frame_id: "tool0_tcp"
+transform: 
+  translation: 
+    x: 0.4026
+    y: -0.1416
+    z: 0.3545
+  rotation: 
+    x: 0.0000
+    y: 0.7071
+    z: 0.0000
+    w: 0.7071
+---
+# Point 4 (P_robot_4)
+header: 
+  seq: 145
+  stamp: 
+    secs: 1678932015
+    nsecs: 330000000
+  frame_id: "base_link"
+child_frame_id: "tool0_tcp"
+transform: 
+  translation: 
+    x: 0.5521
+    y: 0.2357
+    z: 0.4655
+  rotation: 
+    x: 0.0000
+    y: 0.7071
+    z: 0.0000
+    w: 0.7071
+---
+# Point 5 (P_robot_5)
+header: 
+  seq: 146
+  stamp: 
+    secs: 1678932020
+    nsecs: 670000000
+  frame_id: "base_link"
+child_frame_id: "tool0_tcp"
+transform: 
+  translation: 
+    x: 0.3746
+    y: -0.0285
+    z: 0.3748
+  rotation: 
+    x: 0.0000
+    y: 0.7071
+    z: 0.0000
+    w: 0.7071

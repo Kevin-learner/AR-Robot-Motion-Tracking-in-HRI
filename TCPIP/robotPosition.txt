@@ -1,0 +1,17 @@
+header: 
+  seq: 142
+  stamp: 
+    secs: 1678932001
+    nsecs: 450000000
+  frame_id: "base_link"
+child_frame_id: "tool0_tcp"
+transform: 
+  translation: 
+    x: 0.4976
+    y: 0.2600
+    z: 0.2341
+  rotation: 
+    x: 0.0000
+    y: 0.7071
+    z: 0.0000
+    w: 0.7071
