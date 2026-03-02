@@ -206,7 +206,7 @@ def load_tm_matrix(path="tm_matrix.txt"):
 # -------------------------------------------------
 def main():
     #Initialize the video sender
-    sender = VideoSender(camera_index=0)
+    sender = VideoSender(port=8849)
 
     #Initialize the robot controller
     robot = None
@@ -513,14 +513,11 @@ def main():
                 pass
 
             # --- 只有在开关打开时才执行发送函数 ---
+            # --- 重点：视频转发逻辑 ---
             if sender.is_streaming:
-                success = sender.send_frame(conn, sensor_type='c')
-                if not success:
-                    print("⚠️ 帧发送失败")
+                # 这个函数现在会自动找 A 电脑要图并转给 conn (HoloLens)
+                sender.send_frame(conn, sensor_type='c')
                 
-                # 控制发送频率，防止把 TCP 缓冲区撑爆
-                time.sleep(0.04) # 大约 25 FPS
-
     except Exception as e:
         print(f"[TCP] Server Error: {e}")
 
