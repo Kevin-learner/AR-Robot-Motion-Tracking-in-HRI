@@ -64,6 +64,12 @@ except ImportError:
     robotController = None
 
 try:
+    from forceController import ForceController
+except ImportError:
+    print("⚠️ Warning: forceController.py not found. No way to apply forces.")
+    forceController = None
+
+try:
     import pathInterpolation
 except ImportError:
     print("⚠️ Warning: pathInterpolation.py not found. No way to generate paths.")
@@ -210,6 +216,7 @@ def main():
 
     #Initialize the robot controller
     robot = None
+    # robot_force = None
 
     #Initialize the robot listener
     robot_listener = robotPositionListener.RobotPositionListener(port=5006)
@@ -434,6 +441,78 @@ def main():
                             print(f"   🚀 开始执行，总插值点数: {len(final_smooth_path)}")
                             # 发送给机械臂执行
                             robot.execute_path(final_smooth_path, speed=0.02)
+                    else:
+                        print("   ⚠️ T_M 矩阵为空，请先进行校准发送 'c'！")
+                    print("="*50 + "\n")
+
+                # ===============================================
+                # CASE 'f': 接收力控点序列 (Position + Orientation + Force)
+                # ===============================================
+                elif header == 'f':
+                    print("\n" + "="*50)
+                    print("[TCP] 检测到 Header 'f'，开始解析【力控】位姿序列...")
+                    
+                    # 1. 读取点数 (4字节 Int)
+                    count_bytes = recv_exact(conn, 4)
+                    if not count_bytes: 
+                        print("   ❌ 未收到点数数据")
+                        break
+                    
+                    num_points = struct.unpack('<i', count_bytes)[0]
+                    print(f"   -> 计划接收力控关键点数: {num_points}")
+
+                    # 2. 读取数据包 (每个点 32 字节: 3 float pos + 4 float rot + 1 float force)
+                    bytes_per_point = 32
+                    total_bytes = num_points * bytes_per_point
+                    data_bytes = recv_exact(conn, total_bytes)
+                    if not data_bytes: 
+                        print("   ❌ 未收到完整力控数据")
+                        break
+
+                    # 3. 解析与转换数据
+                    if T_M is not None:
+                        # 使用 numpy 将 buffer 转换为 (N, 8) 的矩阵
+                        # 每一行: [x, y, z, qx, qy, qz, qw, force]
+                        raw_payload = np.frombuffer(data_bytes, dtype='<f4').reshape((num_points, 8))
+                        
+                        path_with_force = []
+                        
+                        for i in range(num_points):
+                            # 提取位置
+                            u_pos = raw_payload[i, 0:3]
+                            # 提取四元数姿态 [qx, qy, qz, qw]
+                            u_rot_quat = raw_payload[i, 3:7] 
+                            # 🌟 提取目标力大小
+                            target_force = raw_payload[i, 7]
+
+                            # --- A. 位置转换 (Unity 坐标 -> 机器人坐标) ---
+                            r_pos = rut.unity2robot_transform(u_pos, T_M)
+                            
+                            # --- B. 姿态转换 (复用之前写好的暴力映射/修正函数) ---
+                            res = rut.transform_unity_rot_to_robot(u_rot_quat, T_M)
+
+                            if r_pos is not None:
+                                path_with_force.append({
+                                    'pos': r_pos,
+                                    'rot': res['robot_quat'],
+                                    'force': target_force  # 将力保存进字典
+                                })
+
+                                # --- C. 日志打印 ---
+                                print(f"   [{i}] ---------------------------------------")
+                                print(f"       位置: Unity {np.round(u_pos, 2)} -> 机器人 {np.round(r_pos, 3)}")
+                                print(f"       姿态: 变换RPY(Robot): {np.round(res['robot_rpy'], 1)}°")
+                                print(f"       力控: 设定目标力 = {target_force:.1f} N")
+
+                        # 4. 执行模块 (占位符)
+                        if len(path_with_force) >= 2:
+                            print(f"\n   [Force Control] 数据解析完成，总关键点数: {len(path_with_force)}")
+                            print("   🚀 (占位符) 力控插值与机械臂阻抗控制/混合控制逻辑准备就绪...")
+                            
+                            # TODO: 后续步骤
+                            # 1. 编写带力控标签的 B-Spline 插值 (保持空行程和小力的对应关系)
+                            # 2. 调用 robot.execute_force_path(...)
+                            
                     else:
                         print("   ⚠️ T_M 矩阵为空，请先进行校准发送 'c'！")
                     print("="*50 + "\n")
