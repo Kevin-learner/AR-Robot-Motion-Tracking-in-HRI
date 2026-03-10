@@ -80,20 +80,24 @@ try:
 except ImportError:
     print("⚠️ Warning: videoSender.py not found. No way to send video.")
     VideoSender = None
+
+from tool_tip_ee_transformation import ee_to_tool_tip
+from tool_tip_ee_transformation import tool_tip_to_ee
 # -------------------------------------------------
 # 2. 核心与辅助函数
 # -------------------------------------------------
-def recv_exact(conn, size):
-    """精确读取指定长度的字节"""
-    buffer = b''
-    while len(buffer) < size:
-        try:
-            chunk = conn.recv(size - len(buffer))
-            if not chunk: return None
-            buffer += chunk
-        except Exception:
-            return None
-    return buffer
+def recv_exact(conn, num_bytes):
+    """
+    工业级防 TCP 拆包/粘包接收函数
+    """
+    buffer = bytearray()
+    while len(buffer) < num_bytes:
+        # 还要收多少，就去水管里读多少
+        packet = conn.recv(num_bytes - len(buffer))
+        if not packet:
+            return None # 如果中间断网了，返回 None
+        buffer.extend(packet)
+    return bytes(buffer)
 
 def send_T_M(conn, T_M):
     """发送变换矩阵 T_M"""
@@ -259,7 +263,7 @@ def main():
                 print(f"连接异常: {e}")
                 break
             
-            if header in ['d', 'r', 'b', 'm', 'p', 'v', 'x']:
+            if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f', 'x']:
                 print(f"\n[TCP] Received Header: '{header}'")
                 conn.setblocking(True)
             # ===============================================
@@ -313,14 +317,22 @@ def main():
                     if idx_bytes:
                         point_index = struct.unpack('<i', idx_bytes)[0]
                         
-                        # 读取当前机器人坐标
-                        robot_pos = robot_listener.get_position()
+                        # 🌟 1. 获取机器人 EE 的绝对位姿 (位置 + 姿态)
+                        # 注意：你需要确保你的 get_position() 能同时返回 pos 和 quat
+                        # 假设返回格式为 (ee_pos, ee_quat)，如果你现有的函数只返回 pos，你需要修改它以获取 TF 的 rotation
+                        ee_pos, ee_quat = robot_listener.get_current_pose() 
                         
-                        if robot_pos is not None:
-                            # 保存到文件
-                            save_recorded_point(RECORD_FILE, point_index, robot_pos)
-                        else:
-                            print("   ❌ Failed to read robot position for recording.")
+                        save_recorded_point(RECORD_FILE, point_index, ee_pos)
+                        
+                        # if ee_pos is not None and ee_quat is not None:
+                        #     # 🌟 2. 正向补偿：推算真实笔尖坐标
+                        #     #tool_pos, _ = ee_to_tool_tip(ee_pos, ee_quat)
+                            
+                        #     # 3. 保存到文件 (保存笔尖坐标)
+                        #     save_recorded_point(RECORD_FILE, point_index, tool_pos)
+                        #     print(f"   ✅ 已记录笔尖坐标 {tool_pos} 到索引 {point_index}")
+                        # else:
+                        #     print("   ❌ Failed to read robot position for recording.")
                     else:
                         print("   ⚠️ Received 'r' header but failed to read index.")
 
@@ -348,26 +360,26 @@ def main():
                 # ===============================================
                 # CASE 'm': 移动目标 (Move Target) 
                 # ===============================================
-                elif header == 'm':
-                    data = recv_exact(conn, 12) # 再读 12 个字节 (3个float)
-                    if len(data) == 12:
-                        # '<fff' 表示：小端序 (Little Endian), 3个 float
-                        ux, uy, uz = struct.unpack('<fff', data)
-                        print(f"Unity target received: X={ux}, Y={uy}, Z={uz}")
+                # elif header == 'm':
+                #     data = recv_exact(conn, 12) # 再读 12 个字节 (3个float)
+                #     if len(data) == 12:
+                #         # '<fff' 表示：小端序 (Little Endian), 3个 float
+                #         ux, uy, uz = struct.unpack('<fff', data)
+                #         print(f"Unity target received: X={ux}, Y={uy}, Z={uz}")
 
-                        if T_M is not None:
-                            # === 调用转换函数 ===
-                            target_robot_pos = rut.unity2robot_transform((ux, uy, uz), T_M)
+                #         if T_M is not None:
+                #             # === 调用转换函数 ===
+                #             target_robot_pos = rut.unity2robot_transform((ux, uy, uz), T_M)
                             
-                            if target_robot_pos is not None:
-                                print(f"target in robot coordinate frame{target_robot_pos}")
+                #             if target_robot_pos is not None:
+                #                 print(f"target in robot coordinate frame{target_robot_pos}")
                                 
-                                robot.move_to(target_robot_pos, speed=0.02)
+                #                 robot.move_to(target_robot_pos, speed=0.02)
                                 
-                            else:
-                                print("   ❌ 转换失败")
-                        else:
-                            print("   ⚠️ T_M 尚未计算，无法转换坐标。请先进行校准 (Header 'd')。")
+                #             else:
+                #                 print("   ❌ 转换失败")
+                #         else:
+                #             print("   ⚠️ T_M 尚未计算，无法转换坐标。请先进行校准 (Header 'd')。")
 
                 # ===============================================
                 # CASE 'p': 接收位姿点序列 (Position + Orientation)
@@ -407,7 +419,7 @@ def main():
                             u_rot_quat = raw_payload[i, 3:7] 
 
                             # --- A. 位置转换 (Unity 坐标 -> 机器人坐标) ---
-                            r_pos = rut.unity2robot_transform(u_pos, T_M)
+                            r_pos = rut.unity2robot_transform(u_pos, T_M) #tooltip
                             
                             # --- B. 姿态转换 (调用封装好的函数，内部处理镜像、TM及RPY计算) ---
                             # 该函数应返回一个字典，包含转换后的四元数和用于显示的 RPY

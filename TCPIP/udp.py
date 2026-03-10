@@ -24,12 +24,12 @@ def main():
     hz        = float(rospy.get_param("~hz", 1.0))
 
     parent = rospy.get_param("~parent_frame", "panda_link0")
-    child  = rospy.get_param("~child_frame",  "panda_link8") #
+    child  = rospy.get_param("~child_frame",  "panda_link8")
 
-    # --- new params ---
-    deadband  = float(rospy.get_param("~deadband", 0.0005))  # meters, default 0.5mm
-    send_mode = rospy.get_param("~send_mode", "hold")         # "hold" or "skip"
-    alpha     = float(rospy.get_param("~alpha", 0.0))         # EMA smoothing, 0=off, typical 0.2~0.5
+    # --- params ---
+    deadband  = float(rospy.get_param("~deadband", 0.0005))  
+    send_mode = rospy.get_param("~send_mode", "hold")         
+    alpha     = float(rospy.get_param("~alpha", 0.0))         
 
     if send_mode not in ("hold", "skip"):
         rospy.logwarn("~send_mode should be 'hold' or 'skip', got '%s', using 'hold'", send_mode)
@@ -46,47 +46,63 @@ def main():
                   target_ip, port, parent, child, hz, deadband, send_mode, alpha)
 
     seq = 0
-    last_sent = None          # last "stable" xyz we send
-    last_raw  = None          # last raw xyz (for comparing)
+    last_sent_pos = None          
+    last_raw_pos  = None          
 
     while not rospy.is_shutdown():
         try:
             t = buf.lookup_transform(parent, child, rospy.Time(0), rospy.Duration(0.2))
-            raw = (t.transform.translation.x,
-                   t.transform.translation.y,
-                   t.transform.translation.z)
+            
+            # 1. 获取平移 (XYZ)
+            raw_pos = (t.transform.translation.x,
+                       t.transform.translation.y,
+                       t.transform.translation.z)
+            
+            # 🌟 2. 获取姿态 (Quaternion)
+            raw_quat = (t.transform.rotation.x,
+                        t.transform.rotation.y,
+                        t.transform.rotation.z,
+                        t.transform.rotation.w)
 
             # initialize
-            if last_sent is None:
-                last_sent = raw
-                last_raw = raw
+            if last_sent_pos is None:
+                last_sent_pos = raw_pos
+                last_raw_pos = raw_pos
 
-            # optional EMA smoothing applied to raw before deadband compare
-            cur = raw
+            # optional EMA smoothing applied to raw position
+            cur_pos = raw_pos
             if alpha > 0.0:
-                cur = ema(last_sent, raw, alpha)
+                cur_pos = ema(last_sent_pos, raw_pos, alpha)
 
-            # decide update
-            d = dist(cur, last_sent)
+            # decide update based on position
+            d = dist(cur_pos, last_sent_pos)
             updated = False
             if d >= deadband:
-                last_sent = cur
+                last_sent_pos = cur_pos
                 updated = True
 
             # send policy
             if updated or send_mode == "hold":
-                x, y, z = last_sent
-                pkt = struct.pack("!fff", float(x), float(y), float(z))
+                x, y, z = last_sent_pos
+                qx, qy, qz, qw = raw_quat # 姿态直接使用最新值，不加 deadband 限制
+                
+                # 🌟 3. 打包 7 个 float (28 字节)
+                pkt = struct.pack("!fffffff", float(x), float(y), float(z), float(qx), float(qy), float(qz), float(qw))
                 sock.sendto(pkt, (target_ip, port))
                 seq += 1
+                
                 if updated:
-                    rospy.loginfo("sent #%d UPDATED d=%.6f xyz=(%.6f, %.6f, %.6f)", seq, d, x, y, z)
+                    rospy.loginfo("sent #%d UPDATED d=%.6f xyz=(%.4f, %.4f, %.4f) q=(%.2f, %.2f, %.2f, %.2f)", 
+                                  seq, d, x, y, z, qx, qy, qz, qw)
                 else:
-                    rospy.loginfo("sent #%d HOLD    d=%.6f xyz=(%.6f, %.6f, %.6f)", seq, d, x, y, z)
+                    # 避免 HOLD 模式疯狂刷屏，仅在调试时取消注释
+                    rospy.loginfo("sent #%d HOLD    d=%.6f xyz=(%.4f, %.4f, %.4f) q=(%.3f, %.3f, %.3f, %.3f)", 
+                                  seq, d, x, y, z, qx, qy, qz, qw)
+                    pass 
             else:
-                rospy.loginfo("skip (d=%.6f < deadband)", d)
+                pass
 
-            last_raw = raw
+            last_raw_pos = raw_pos
 
         except Exception as e:
             rospy.logwarn_throttle(2.0, "TF/UDP failed: %s", str(e))

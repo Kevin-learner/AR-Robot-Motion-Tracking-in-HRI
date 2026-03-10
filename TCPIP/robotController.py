@@ -18,13 +18,13 @@ class RobotController:
         self.target_topic = f"/{self.controller_name}/equilibrium_pose"
         
         self.base_frame = "panda_link0"
-        self.ee_frame = "panda_link8" 
+        self.ee_frame = "panda_link8" # 暴力锚定 link8 (或者 panda_EE)
 
-        # 唯一发布者：发布平衡点 (Equilibrium Pose)
+        # 发布平衡点 (Equilibrium Pose)
         self.pub = rospy.Publisher(self.target_topic, geometry_msgs.msg.PoseStamped, queue_size=1)
         
         # 力控核心参数
-        self.K_z = 1000.0 # Z轴刚度 N/m (必须与 rqt_reconfigure 里面的 translational_stiffness 保持一致)
+        self.K_z = 400.0 # Z轴刚度 N/m 
 
         self.tf_listener = tf.TransformListener()
         self.path_queue = Queue()      
@@ -41,10 +41,10 @@ class RobotController:
         print(f"⏳ [Robot] 等待 TF 变换...")
         try:
             self.tf_listener.waitForTransform(self.base_frame, self.ee_frame, rospy.Time(0), rospy.Duration(5.0))
-            # 初始化起点：当前位置，当前姿态，初始力设为 0.0N
+            # 初始化起点：当前法兰位置，当前姿态，初始力0N
             p, r = self.get_current_pose()
             self.last_target_state = (p, r, 0.0)
-            print(f"✅ [Robot] 统一阻抗控制模式已就绪！")
+            print(f"✅ [Robot] 暴力 link8 阻抗控制模式已就绪！")
         except Exception as e:
             print(f"❌ [Robot] TF 失败: {e}")
 
@@ -56,7 +56,7 @@ class RobotController:
             return None, None
 
     def _path_executor(self):
-        rate_hz = 200 # 高频发布，保证弹簧系统的稳定性
+        rate_hz = 200 
         rate = rospy.Rate(rate_hz)
         msg = geometry_msgs.msg.PoseStamped()
         msg.header.frame_id = self.base_frame
@@ -65,133 +65,95 @@ class RobotController:
             if not self.path_queue.empty():
                 step_data = self.path_queue.get()
                 
-                # --- 1. 提取目标数据 ---
                 target_pos = np.array(step_data['pos'])
                 target_rot = step_data['rot']
-                
-                # 【神来之笔】：如果字典里没有 'force' 键（说明是纯位置模式发来的），默认设为 0N
                 target_force = step_data.get('force', 0.0) 
                 
-                # --- 2. 提取起点数据 ---
                 start_pos, start_rot, start_force = self.last_target_state
                 
-                # --- 3. 计算运动时间 ---
                 dist = np.linalg.norm(target_pos - start_pos)
                 force_diff = abs(target_force - start_force)
 
-                # 只要位置有移动，或者力有变化（原地施压），就触发插值运动
-                if dist > 0.0001 or force_diff > 0.1:
-                    # 确保即使距离很短，力的改变也有足够的缓冲时间 (至少0.5秒)
-                    duration = max(dist / max(self.target_speed, 0.001), 0.5 if force_diff > 0.1 else 0.0) 
-                    total_steps = int(duration * rate_hz)
+                if dist > 0.0001 or force_diff > 0.01:
+                    pos_duration = dist / max(self.target_speed, 0.001)
+                    force_duration = force_diff / 1.0 
+                    duration = max(pos_duration, force_duration)
+                    
+                    # ==========================================================
+                    # 🌟 1. 智能判断：是稀疏关键点，还是密集的 B 样条点？
+                    # 假设两点之间距离小于 1 厘米 (0.01m)，我们就认为是密集的连续曲线
+                    is_dense_curve = dist < 0.01 
+                    
+                    # 只有稀疏点，才强制加 0.1s 的缓冲时间；密集点不需要！
+                    if not is_dense_curve:
+                        if duration < 0.1: duration = 0.1 
+                    # ==========================================================
+
+                    # 确保哪怕时间极短，至少执行 1 个 step
+                    total_steps = max(1, int(duration * rate_hz))
 
                     for i in range(1, total_steps + 1):
                         if not self.is_running or rospy.is_shutdown(): break
                         
                         t = i / float(total_steps)
-                        smooth_t = (1.0 - math.cos(t * math.pi)) / 2.0 # S型速度曲线
+                        
+                        # ==========================================================
+                        # 🌟 2. 动态切换插值算法 (解决卡顿的核心)
+                        if is_dense_curve:
+                            # 密集点：使用【匀速直线插值】。点够密了，直接匀速穿过，不刹车！
+                            smooth_t = t 
+                        else:
+                            # 稀疏点：使用【S型起停插值】。保护机械臂在长距离移动时平滑。
+                            smooth_t = (1.0 - math.cos(t * math.pi)) / 2.0
+                        # ==========================================================
 
-                        # --- 4. 核心插值计算 ---
                         curr_p = start_pos + (target_pos - start_pos) * smooth_t
                         curr_r = quaternion_slerp(start_rot, target_rot, smooth_t)
-                        curr_f = start_force + (target_force - start_force) * smooth_t # 力的平滑渐变
+                        curr_f = start_force + (target_force - start_force) * smooth_t 
 
-                        # --- 5. 阻抗控制 Z 轴偏移补偿 (胡克定律) ---
-                        # 无论此时 curr_f 是多少 (哪怕是0)，这套公式都通用
+
+                        ee_pos = curr_p
+                        ee_rot = curr_r
+                        # --- (如果你还在用笔尖补偿，保留下面这行，否则删掉) ---
+                        #ee_pos, ee_rot = tool_tip_to_ee(curr_p, curr_r, self.tool_length)
+                        # ----------------------------------------------------
+
+                        # 阻抗控制 Z 轴偏移补偿
                         z_offset = curr_f / self.K_z
-                        
-                        # 真实发送给控制器的 Z = Unity轨迹Z - 弹簧下压量
-                        actual_target_z = curr_p[2] - z_offset 
+                        actual_target_z = ee_pos[2] - z_offset 
 
-                        # --- 6. 构建并发布 ROS 消息 ---
                         msg.header.stamp = rospy.Time.now()
-                        msg.pose.position.x = curr_p[0]
-                        msg.pose.position.y = curr_p[1]
+                        msg.pose.position.x = ee_pos[0]
+                        msg.pose.position.y = ee_pos[1]
                         msg.pose.position.z = actual_target_z
                         
-                        msg.pose.orientation.x = curr_r[0]
-                        msg.pose.orientation.y = curr_r[1]
-                        msg.pose.orientation.z = curr_r[2]
-                        msg.pose.orientation.w = curr_r[3]
+                        msg.pose.orientation.x = ee_rot[0]
+                        msg.pose.orientation.y = ee_rot[1]
+                        msg.pose.orientation.z = ee_rot[2]
+                        msg.pose.orientation.w = ee_rot[3]
 
                         self.pub.publish(msg)
                         rate.sleep()
                 
-                # --- 7. 更新最后一次状态 ---
                 self.last_target_state = (target_pos, target_rot, target_force)
                 self.path_queue.task_done()
             else:
                 rate.sleep()
 
     def execute_path(self, path_list, speed=None):
-        """
-        接收完整的字典列表并执行: [{'pos': [x,y,z], 'rot': [x,y,z,w], 'force': 5.0}, ...]
-        注意：如果没有 'force' 键，将自动作为 0N 的柔顺位置控制处理。
-        """
         if not path_list: return
         if speed is not None: self.target_speed = speed
 
-        # 获取当前实际位姿作为新轨迹起点
+        # 暴力获取 link8 当前位置当做起点
         p, r = self.get_current_pose()
         if p is not None:
-            # 继承上一次的力，防止两段路径拼接时力瞬间归零
             current_f = self.last_target_state[2] if self.last_target_state else 0.0
             self.last_target_state = (p, r, current_f)
 
-        # 清空旧队列，压入新任务
         with self.path_queue.mutex:
             self.path_queue.queue.clear()
         
         for step in path_list:
             self.path_queue.put(step)
         
-        print(f"🚀 [Path] 正在执行统一阻抗控制路径，点数: {len(path_list)}")
-
-        
-if __name__ == "__main__":
-    try:
-        controller = RobotController()
-        rospy.sleep(1.0)
-        
-        start_p, start_r = controller.get_current_pose()
-        if start_p is not None:
-            print("\n" + "="*40)
-            print("🧪 统一阻抗控制 - 触碰与力控测试")
-            print("="*40)
-            print("⚠️ 准备工作：")
-            print("请手动将机械臂（笔尖）移动到桌面上方约 2 厘米处。")
-            print("确保下方有桌面或纸张可以提供物理支撑。")
-            print("="*40)
-            
-            # 假设向下走 2 厘米正好接触到纸张 (Z轴负方向)
-            down_distance = 0.02 
-            touch_pos = start_p.copy()
-            touch_pos[2] -= down_distance 
-            
-            # 设计测试路径：悬停 -> 接触(2N) -> 用力压(5N) -> 卸力(0N) -> 抬起
-            test_path = [
-                # 1. 起点悬停，准备下放 (0N)
-                {'pos': start_p, 'rot': start_r, 'force': 0.0},
-                
-                # 2. 慢慢降落到桌面高度，并施加 2.0N 的轻微接触力 (空行程模拟)
-                {'pos': touch_pos, 'rot': start_r, 'force': 2.0},
-                
-                # 3. 保持在桌面位置，力增加到 5.0N (模拟用力写字)
-                {'pos': touch_pos, 'rot': start_r, 'force': 5.0},
-                
-                # 4. 保持在桌面，卸力回到 0N (停止按压，但仍贴着桌面)
-                {'pos': touch_pos, 'rot': start_r, 'force': 0.0},
-                
-                # 5. 抬回初始悬停高度
-                {'pos': start_p, 'rot': start_r, 'force': 0.0}
-            ]
-            
-            input("\n👉 按回车开始执行【下探并施加力】测试...")
-            
-            # 为了让你可以清楚地看到“逐步用力”的过程，我们把速度放慢
-            controller.execute_path(test_path, speed=0.01)
-            
-            rospy.spin()
-    except rospy.ROSInterruptException:
-        pass
-    
+        print(f"🚀 [Path] 正在执行暴力 link8 轨迹，点数: {len(path_list)}")
