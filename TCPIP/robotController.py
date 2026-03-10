@@ -155,15 +155,43 @@ if __name__ == "__main__":
         
         start_p, start_r = controller.get_current_pose()
         if start_p is not None:
-            # 模拟新数据格式进行测试
+            print("\n" + "="*40)
+            print("🧪 统一阻抗控制 - 触碰与力控测试")
+            print("="*40)
+            print("⚠️ 准备工作：")
+            print("请手动将机械臂（笔尖）移动到桌面上方约 2 厘米处。")
+            print("确保下方有桌面或纸张可以提供物理支撑。")
+            print("="*40)
+            
+            # 假设向下走 2 厘米正好接触到纸张 (Z轴负方向)
+            down_distance = 0.02 
+            touch_pos = start_p.copy()
+            touch_pos[2] -= down_distance 
+            
+            # 设计测试路径：悬停 -> 接触(2N) -> 用力压(5N) -> 卸力(0N) -> 抬起
             test_path = [
-                {'pos': start_p + np.array([0, 0.05, 0]), 'rot': start_r},
-                {'pos': start_p + np.array([0, 0.10, 0]), 'rot': start_r}
+                # 1. 起点悬停，准备下放 (0N)
+                {'pos': start_p, 'rot': start_r, 'force': 0.0},
+                
+                # 2. 慢慢降落到桌面高度，并施加 2.0N 的轻微接触力 (空行程模拟)
+                {'pos': touch_pos, 'rot': start_r, 'force': 2.0},
+                
+                # 3. 保持在桌面位置，力增加到 5.0N (模拟用力写字)
+                {'pos': touch_pos, 'rot': start_r, 'force': 5.0},
+                
+                # 4. 保持在桌面，卸力回到 0N (停止按压，但仍贴着桌面)
+                {'pos': touch_pos, 'rot': start_r, 'force': 0.0},
+                
+                # 5. 抬回初始悬停高度
+                {'pos': start_p, 'rot': start_r, 'force': 0.0}
             ]
             
-            input("👉 按回车开始执行测试路径...")
-            controller.execute_path(test_path, speed=0.02)
+            input("\n👉 按回车开始执行【下探并施加力】测试...")
+            
+            # 为了让你可以清楚地看到“逐步用力”的过程，我们把速度放慢
+            controller.execute_path(test_path, speed=0.01)
             
             rospy.spin()
     except rospy.ROSInterruptException:
         pass
+    
