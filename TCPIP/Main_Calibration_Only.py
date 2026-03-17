@@ -15,7 +15,15 @@ def load_config(path="config.yaml"):
         'tcp': {'host': '0.0.0.0', 'port': 8848},
         'alignment': {'aruco_path': 'Realsense_Aruco.txt'},
         'robot': {'position_file': 'robotPosition.txt'},
-        'recording': {'output_file': 'calibration_data_recorded.txt'} # 默认保存路径
+        'recording': {'output_file': 'calibration_data_recorded.txt'}, # 默认保存路径
+        'handeyecalibration': {
+            'EE_T_C': [  # 默认的末端到相机的变换矩阵 (T_EE_C)，可以在 config.yaml 中覆盖
+                [0.7029200982,  -0.7111337457,  0.01386113997,  0.0115],
+                [0.7112536662,  0.7028988485,  -0.007171549375,  -0.065],
+                [-0.004643048551,  0.01489981281,  0.9998782114,  0.032],
+                [0,  0,  0,  1]
+            ]
+        }
     }
     try:
         if os.path.exists(path):
