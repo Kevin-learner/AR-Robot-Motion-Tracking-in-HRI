@@ -5,6 +5,8 @@ import struct
 import tf2_ros
 import math
 
+from tf.transformations import euler_from_quaternion
+
 def dist(a, b):
     return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2 + (a[2]-b[2])**2)
 
@@ -63,6 +65,8 @@ def main():
                         t.transform.rotation.y,
                         t.transform.rotation.z,
                         t.transform.rotation.w)
+            
+            
 
             # initialize
             if last_sent_pos is None:
@@ -85,20 +89,28 @@ def main():
             if updated or send_mode == "hold":
                 x, y, z = last_sent_pos
                 qx, qy, qz, qw = raw_quat # 姿态直接使用最新值，不加 deadband 限制
+
+                rx_rad, ry_rad, rz_rad = euler_from_quaternion([qx, qy, qz, qw])
                 
-                # 🌟 3. 打包 7 个 float (28 字节)
+                # 🌟 3. 将弧度转换为角度 (Deg)，方便人类阅读调试
+                rx_deg = math.degrees(rx_rad)
+                ry_deg = math.degrees(ry_rad)
+                rz_deg = math.degrees(rz_rad)
+                
+                # 🌟 4. 打包 7 个 float (28 字节)
                 pkt = struct.pack("!fffffff", float(x), float(y), float(z), float(qx), float(qy), float(qz), float(qw))
                 sock.sendto(pkt, (target_ip, port))
                 seq += 1
                 
                 if updated:
-                    rospy.loginfo("sent #%d UPDATED d=%.6f xyz=(%.4f, %.4f, %.4f) q=(%.2f, %.2f, %.2f, %.2f)", 
-                                  seq, d, x, y, z, qx, qy, qz, qw)
+                    # 🌟 5. 在打印日志中加入 Rx, Ry, Rz (度数)
+                    rospy.loginfo("sent #%d UPDATED d=%.6f xyz=(%.4f, %.4f, %.4f) Euler[Deg]=(Rx:%.1f, Ry:%.1f, Rz:%.1f) q=(%.2f, %.2f, %.2f, %.2f)", 
+                                  seq, d, x, y, z, rx_deg, ry_deg, rz_deg, qx, qy, qz, qw)
                 else:
-                    # 避免 HOLD 模式疯狂刷屏，仅在调试时取消注释
-                    rospy.loginfo("sent #%d HOLD    d=%.6f xyz=(%.4f, %.4f, %.4f) q=(%.3f, %.3f, %.3f, %.3f)", 
-                                  seq, d, x, y, z, qx, qy, qz, qw)
-                    pass 
+                    # 调试期间，你也可以把 HOLD 状态的打印打开
+                    rospy.loginfo("sent #%d HOLD    d=%.6f xyz=(%.4f, %.4f, %.4f) Euler[Deg]=(Rx:%.1f, Ry:%.1f, Rz:%.1f)", 
+                                  seq, d, x, y, z, rx_deg, ry_deg, rz_deg)
+                    pass
             else:
                 pass
 

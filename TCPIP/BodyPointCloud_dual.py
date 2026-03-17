@@ -57,12 +57,12 @@ window_created = False
 state = AppState()
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
-T_Stereo = np.loadtxt(config['alignment']['stereo_transform_path'])
-#T_Stereo = np.loadtxt("G:/DualCameras/PythonProject/Matlab/T_icp_updated.txt")
-R = T_Stereo[:3, :3]
-T = T_Stereo[:3, 3]
-print("📌 Transform matrix (Camera2 → Camera1), with translation in meters:")
-print(T_Stereo)
+# T_Stereo = np.loadtxt(config['alignment']['stereo_transform_path'])
+# #T_Stereo = np.loadtxt("G:/DualCameras/PythonProject/Matlab/T_icp_updated.txt")
+# R = T_Stereo[:3, :3]
+# T = T_Stereo[:3, 3]
+# print("📌 Transform matrix (Camera2 → Camera1), with translation in meters:")
+# print(T_Stereo)
 skeleton_pairs = [
     (0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (0, 5), (0, 6),
     (5, 7), (7, 9), (6, 8), (8, 10), (5, 11), (6, 12),

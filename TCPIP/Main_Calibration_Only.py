@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import cv2
+from scipy.spatial.transform import Rotation as R
 
 # netsh interface portproxy add v4tov4 listenaddress=192.168.137.1 listenport=[本地监听端口] connectaddress=[机械臂的Tailscale IP] connectport=[机械臂服务端口]
 
@@ -117,6 +118,11 @@ except ImportError:
     print("⚠️ Warning: camera2unity.py not found. No way to compute camera to unity matrix.")
     get_camera_to_unity_matrix = None
 
+try:
+    from camera2unity import get_rotation_matrix_scipy
+except ImportError:
+    print("⚠️ Warning: camera2unity.py not found. No way to compute rotation matrix.")
+    get_rotation_matrix_scipy = None
 # -------------------------------------------------
 # 2. 核心与辅助函数
 # -------------------------------------------------
@@ -688,20 +694,29 @@ def main():
 
                     #EE->Robot
                     ee_pos, ee_quat = robot_listener.get_current_pose()
+                    #print(f"🤖 机械臂 Z轴高度 : {ee_pos[2]:.3f} (米)")
+                    ee_T_robot = np.eye(4)
+                    rot_matrix = R.from_quat(ee_quat).as_matrix() 
+                    ee_T_robot[:3, :3] = rot_matrix
+                    ee_T_robot[:3, 3] = ee_pos
+
+                    C_T_Base = ee_T_robot @ EE_T_C
 
                     C_T_Unity = get_camera_to_unity_matrix(ee_pos, ee_quat, EE_T_C, T_M) if get_camera_to_unity_matrix else np.eye(4)
+                    
+                    T_offset  = get_rotation_matrix_scipy(180, 0, 0)
+                    #print(T_offset)
 
+                    C_T_Unity_offset = C_T_Unity @ T_offset
 
                     # 1. 调用算法获取当前帧的坐标 (目前算法会返回 59 个点)
-                    camera_coords, should_quit = Body3DSkeletonProcess_dual(C_T_Unity, use_dual_camera=False)
+                    camera_coords, should_quit = Body3DSkeletonProcess_dual(C_T_Unity_offset, use_dual_camera=False)
+
                     
                     if not should_quit and camera_coords:
                         # 2. 截取前 17 个身体关键点 (丢掉后面的手部点)
                         body_only_coords = camera_coords[:17]
                         
-                        # 3. 发送给 Unity
-                        # 注意：如果 Body3DSkeletonProcess_dual 内部还没有乘 T_M，你需要在这里乘
-                        # 但因为你在函数参数里传了 T_M，假设内部已经做好了转换。
                         send_skeleton_data(conn, body_only_coords)
                 else:
                     # 防止疯狂打印，可以加个简单的限流，或者只提醒一次

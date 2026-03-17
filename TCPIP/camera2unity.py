@@ -13,7 +13,7 @@ def get_camera_to_unity_matrix(ee_pos, ee_quat, EE_T_C, T_M):
     
     # 1. 计算 C_T_EE (求逆)
     # 假设 EE_T_C 是把末端转相机的矩阵，如果是反过来的，去掉 np.linalg.inv 即可
-    C_T_EE = np.linalg.inv(EE_T_C) 
+    C_T_EE = EE_T_C
 
     # 2. 计算 ee_T_robot (把末端位姿转成 4x4 矩阵)
     ee_T_robot = np.eye(4)
@@ -30,3 +30,24 @@ def get_camera_to_unity_matrix(ee_pos, ee_quat, EE_T_C, T_M):
     C_T_unity = robot_T_unity @ ee_T_robot @ C_T_EE
 
     return C_T_unity
+
+def get_rotation_matrix_scipy(rx_deg, ry_deg, rz_deg, seq='xyz'):
+    """
+    输入绕 X, Y, Z 轴的旋转角度 (度数)，输出 3x3 旋转矩阵
+    :param rx_deg: 绕 X 轴旋转角度 (Degree)
+    :param ry_deg: 绕 Y 轴旋转角度 (Degree)
+    :param rz_deg: 绕 Z 轴旋转角度 (Degree)
+    :param seq: 旋转顺序，默认 'xyz' (外旋) 或 'XYZ' (内旋)。机器人常用 'xyz' 或 'zyx'
+    :return: 3x3 numpy 旋转矩阵
+    """
+    # 1. 初始化一个 4x4 的单位矩阵 (对角线为1，其余为0)
+    T = np.eye(4)
+    
+    # 2. 计算 3x3 旋转矩阵
+    rot_matrix = R.from_euler(seq, [rx_deg, ry_deg, rz_deg], degrees=True).as_matrix()
+    
+    # 3. 把旋转矩阵塞进左上角 3x3 区域
+    T[:3, :3] = rot_matrix
+    
+    
+    return T
