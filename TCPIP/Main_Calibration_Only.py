@@ -35,7 +35,8 @@ config = load_config()
 HOST = config['tcp']['host']
 PORT = config['tcp']['port']
 ROBOT_POS_FILE = config['robot']['position_file']
-RECORD_FILE = config['recording']['output_file'] # [新增] 保存路径
+RECORD_FILE = config['recording']['output_file'] #  保存路径
+EE_T_C = np.array(config['handeyecalibration']['EE_T_C']) # 从配置加载 EE_T_C
 
 # import calibration module
 try:
@@ -99,6 +100,12 @@ try:
 except ImportError:
     print("⚠️ Warning: tool_tip_ee_transformation.py not found. No way to compensate TCP.")
     tool_tip_to_ee = None
+
+try:
+    from camera2unity import get_camera_to_unity_matrix
+except ImportError:
+    print("⚠️ Warning: camera2unity.py not found. No way to compute camera to unity matrix.")
+    get_camera_to_unity_matrix = None
 
 # -------------------------------------------------
 # 2. 核心与辅助函数
@@ -666,8 +673,18 @@ def main():
             # --- 重点：骨架捕获与转发逻辑 ---
             if is_skeleton_streaming and Body3DSkeletonProcess_dual:
                 if T_M is not None:
+                    #T_M Robot->Unity
+                    
+                    #EE->Camera EE_T_C load from config
+
+                    #EE->Robot
+                    ee_pos, ee_quat = robot_listener.get_current_pose()
+
+                    C_T_Unity = get_camera_to_unity_matrix(ee_pos, ee_quat, EE_T_C, T_M) if get_camera_to_unity_matrix else np.eye(4)
+
+
                     # 1. 调用算法获取当前帧的坐标 (目前算法会返回 59 个点)
-                    camera_coords, should_quit = Body3DSkeletonProcess_dual(T_M, use_dual_camera=False)
+                    camera_coords, should_quit = Body3DSkeletonProcess_dual(C_T_Unity, use_dual_camera=False)
                     
                     if not should_quit and camera_coords:
                         # 2. 截取前 17 个身体关键点 (丢掉后面的手部点)

@@ -30,3 +30,12 @@ robot:
 
 recording:
   output_file: "calibration_data_recorded.txt" # File to save recorded calibration data
+
+handeyecalibration:
+  EE_T_C:                        # End-effector to camera transformation matrix (T_EE_C)
+    [
+      [0.7029200982,  -0.7111337457,  0.01386113997,  0.0115],
+      [0.7112536662,  0.7028988485,  -0.007171549375,  -0.065],
+      [-0.004643048551,  0.01489981281,  0.9998782114,  0.032],
+      [0,  0,  0,  1]
+    ] 
