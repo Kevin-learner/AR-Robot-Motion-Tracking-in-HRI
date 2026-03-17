@@ -45,6 +45,7 @@ def unity2robot_transform(unity_pos, T_M):
     
 def robot2unity_transform(point_3d, transformation_matrix):
     """应用变换矩阵 P_new = T * P_old"""
+    point_3d[2] = -point_3d[2]  # z=-z
     p_homogeneous = np.append(point_3d, 1)
     return (transformation_matrix @ p_homogeneous)[:3]
 

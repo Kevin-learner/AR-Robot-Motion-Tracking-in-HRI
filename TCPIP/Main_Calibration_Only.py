@@ -7,6 +7,8 @@ import sys
 import time
 import cv2
 
+# netsh interface portproxy add v4tov4 listenaddress=192.168.137.1 listenport=[本地监听端口] connectaddress=[机械臂的Tailscale IP] connectport=[机械臂服务端口]
+
 # -------------------------------------------------
 # 1. 基础配置与加载
 # -------------------------------------------------
@@ -163,7 +165,6 @@ def read_and_parse_robot_txt(file_path):
 def send_robot_ball_position(conn, robot_raw_pos, T_M):
     """计算并发送小球坐标"""
     try:
-        robot_raw_pos[2] = -robot_raw_pos[2]
         unity_pos = rut.robot2unity_transform(robot_raw_pos, T_M)
 
         header = b'b'
