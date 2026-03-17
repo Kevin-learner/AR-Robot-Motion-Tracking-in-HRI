@@ -81,8 +81,25 @@ except ImportError:
     print("⚠️ Warning: videoSender.py not found. No way to send video.")
     VideoSender = None
 
-from tool_tip_ee_transformation import ee_to_tool_tip
-from tool_tip_ee_transformation import tool_tip_to_ee
+try:
+    from BodyPointCloud_dual import Body3DSkeletonProcess_dual
+    print("✅ BodyPointCloud 导入完毕！")
+except ImportError:
+    print("⚠️ Warning: BodyPointCloud_dual.py not found. Skeleton tracking disabled.")
+    Body3DSkeletonProcess_dual = None
+
+try:
+    from tool_tip_ee_transformation import ee_to_tool_tip
+except ImportError:
+    print("⚠️ Warning: tool_tip_ee_transformation.py not found. No way to compensate TCP.")
+    ee_to_tool_tip = None
+
+try:
+    from tool_tip_ee_transformation import tool_tip_to_ee
+except ImportError:
+    print("⚠️ Warning: tool_tip_ee_transformation.py not found. No way to compensate TCP.")
+    tool_tip_to_ee = None
+
 # -------------------------------------------------
 # 2. 核心与辅助函数
 # -------------------------------------------------
@@ -211,10 +228,41 @@ def load_tm_matrix(path="tm_matrix.txt"):
             print(f"⚠️ [System] Found T_M file but failed to load: {e}")
     return None
 
+
+def send_skeleton_data(conn, send_coords):
+    """
+    将 17 个骨骼关键点 (51个float) 打包发送给客户端
+    数据格式: b's' + 51个小端序float (共 1 + 204 = 205 bytes)
+    """
+    try:
+        # 1. 展平列表: 把 [(x1,y1,z1), (x2,y2,z2)...] 变成 [x1, y1, z1, x2, y2, z2...]
+        flat_coords = [coord for pt in send_coords for coord in pt]
+        
+        # 2. 检查数据长度是否正确 (17 * 3 = 51)
+        if len(flat_coords) != 51:
+            # 如果进来的数据是59个点，我们自动截断到前17个
+            if len(flat_coords) >= 51:
+                flat_coords = flat_coords[:51]
+            else:
+                print(f"⚠️ Skeleton data length mismatch. Expected >=51, got {len(flat_coords)}")
+                return
+
+        # 3. 打包: 's' 是包头，'<51f' 表示 51 个小端序的单精度浮点数
+        header = b's'
+        payload = struct.pack('<' + 'f' * len(flat_coords), *flat_coords)
+        
+        # 4. 发送
+        conn.sendall(header + payload)
+        # print(f"  -> Sent Skeleton Frame: 17 joints.") # 频率太高可以注释掉这行
+        
+    except Exception as e:
+        print(f"❌ Error sending skeleton pos: {e}")
+
 # -------------------------------------------------
 # 3. 主循环
 # -------------------------------------------------
 def main():
+    print("🚀 Starting TCP/IP Server..")
     #Initialize the video sender
     sender = VideoSender(port=8849)
 
@@ -229,6 +277,8 @@ def main():
     sSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     T_M = None 
+
+    is_skeleton_streaming = False
 
     # [新增] 获取缓存文件路径
     TM_CACHE_PATH = config['alignment'].get('tm_cache_file', 'tm_matrix.npy')
@@ -263,7 +313,7 @@ def main():
                 print(f"连接异常: {e}")
                 break
             
-            if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f', 'x']:
+            if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f']:
                 print(f"\n[TCP] Received Header: '{header}'")
                 conn.setblocking(True)
             # ===============================================
@@ -585,6 +635,12 @@ def main():
             elif header == 'E': 
                 sender.is_streaming = False
                 print("⏹️ 停止传输")
+            elif header == 'K': 
+                is_skeleton_streaming = True
+                print("▶️ 开始传输【骨架数据】")
+            elif header == 'L': 
+                is_skeleton_streaming = False
+                print("⏹️ 停止传输【骨架数据】")
 
             # ===============================================
             # CASE 'x': 退出 (Exit)
@@ -606,6 +662,26 @@ def main():
             if sender.is_streaming:
                 # 这个函数现在会自动找 A 电脑要图并转给 conn (HoloLens)
                 sender.send_frame(conn, sensor_type='c')
+
+            # --- 重点：骨架捕获与转发逻辑 ---
+            if is_skeleton_streaming and Body3DSkeletonProcess_dual:
+                if T_M is not None:
+                    # 1. 调用算法获取当前帧的坐标 (目前算法会返回 59 个点)
+                    camera_coords, should_quit = Body3DSkeletonProcess_dual(T_M, use_dual_camera=False)
+                    
+                    if not should_quit and camera_coords:
+                        # 2. 截取前 17 个身体关键点 (丢掉后面的手部点)
+                        body_only_coords = camera_coords[:17]
+                        
+                        # 3. 发送给 Unity
+                        # 注意：如果 Body3DSkeletonProcess_dual 内部还没有乘 T_M，你需要在这里乘
+                        # 但因为你在函数参数里传了 T_M，假设内部已经做好了转换。
+                        send_skeleton_data(conn, body_only_coords)
+                else:
+                    # 防止疯狂打印，可以加个简单的限流，或者只提醒一次
+                    # print("⚠️ 骨架开关已开，但尚未进行相机校准 (T_M is None)！")
+                    pass
+                
                 
     except Exception as e:
         print(f"[TCP] Server Error: {e}")
@@ -619,4 +695,5 @@ def main():
             pass
 
 if __name__ == "__main__":
+    #print("=== Main_Calibration_Only.py ===")
     main()

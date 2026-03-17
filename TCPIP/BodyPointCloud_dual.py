@@ -910,19 +910,54 @@ def main_pointcloud_visualizer_loop():
 
 
 if __name__ == "__main__":
+    import cv2
+    import numpy as np
+    import queue
+    from global_config import pointcloud_display_queue
+
+    print("🚀 启动极简【纯骨架】显示模式...")
+
     while True:
         T_M = np.array([[1, 0, 0, 0],
                         [0, -1, 0, 0],
                         [0, 0, -1, 0],
                         [0, 0, 0, 1]])
 
-        send_coords, should_quit = BodyPointCloudProcess_dual(T_M, max_points=4000, use_dual_camera=False, ero_para=1)
+        # ⚠️ 注意这里：既然要看骨架，我帮你换成了 Body3DSkeletonProcess_dual
+        send_coords, should_quit = Body3DSkeletonProcess_dual(T_M, use_dual_camera=False)
 
         if should_quit:
-            print("⚠️ No valid person detected in this frame, retrying...")
+            print("⚠️ 未检测到人...")
             continue
 
-        print(f"✅ Frame OK, {len(send_coords)} points captured.")
+        try:
+            # 1. 从原有的队列中把后台算好的数据拿出来（如果不拿出来，队列满了会卡死）
+            data = pointcloud_display_queue.get_nowait()
+            
+            # 2. 根据你代码里往队列塞数据的顺序，提取出我们需要的东西
+            color_image_1 = data[9] # 原始画面（仅用来获取尺寸）
+            pose_2d_1 = data[11]    # 2D 骨架关键点位置
+            
+            # 3. 创建一个和原画面一样大的【纯黑背景】
+            black_canvas = np.zeros_like(color_image_1)
+
+            # 4. 使用你代码里自带的画图函数，在黑板上画出绿色的点和线
+            if pose_2d_1 is not None and len(pose_2d_1) > 0:
+                draw_pose_2d(black_canvas, pose_2d_1, skeleton_pairs, color=(0, 255, 0), radius=4, thickness=2)
+
+            # 5. 在主线程安全地显示画面
+            cv2.imshow("Pure Skeleton View", black_canvas)
+            
+            # 按 Esc 键安全退出
+            if cv2.waitKey(1) == 27: 
+                print("👋 已手动退出程序。")
+                break
+
+        except queue.Empty:
+            # 队列里没数据就跳过，等下一帧
+            pass
+
+
 
 
 
