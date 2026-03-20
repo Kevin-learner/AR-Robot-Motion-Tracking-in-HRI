@@ -562,7 +562,7 @@ def Body3DSkeletonProcess_dual(T_M, use_dual_camera=False):
         pose_2d_1, pose_3d_1, verts_1, texcoords_1, colors_1, color_image_1, depth_intrinsics_1, mapped_frame_1, depth_frame_1, points_1 = result
 
         pose_3d_raw_1 = pose_3d_1.copy()
-        pose_3d_1[:, 2] *= -1
+        #pose_3d_1[:, 2] *= -1
         pose_3d_transformed_1 = transform_points(pose_3d_1, T_M)
         send_coords = [tuple(p) for p in pose_3d_transformed_1]
         send_coords = apply_kalman_filter_to_skeleton(send_coords, use_transform=False)

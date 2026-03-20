@@ -685,36 +685,31 @@ def main():
                 # 这个函数现在会自动找 A 电脑要图并转给 conn (HoloLens)
                 sender.send_frame(conn, sensor_type='c')
 
-            # --- 重点：骨架捕获与转发逻辑 ---
             if is_skeleton_streaming and Body3DSkeletonProcess_dual:
                 if T_M is not None:
-                    #T_M Robot->Unity
-                    
-                    #EE->Camera EE_T_C load from config
-
-                    #EE->Robot
+                    # 1. 提取机器人的实时位姿 (EE -> Base)
                     ee_pos, ee_quat = robot_listener.get_current_pose()
-                    #print(f"🤖 机械臂 Z轴高度 : {ee_pos[2]:.3f} (米)")
                     ee_T_robot = np.eye(4)
-                    rot_matrix = R.from_quat(ee_quat).as_matrix() 
-                    ee_T_robot[:3, :3] = rot_matrix
+                    ee_T_robot[:3, :3] = R.from_quat(ee_quat).as_matrix()
                     ee_T_robot[:3, 3] = ee_pos
 
-                    C_T_Base = ee_T_robot @ EE_T_C
+                    # 2. 🌟 构造 Z 轴翻转矩阵 (关键：在 Base 和 T_M 之间翻转高度)
+                    F_z = np.eye(4)
+                    F_z[2, 2] = -1.0
 
-                    C_T_Unity = get_camera_to_unity_matrix(ee_pos, ee_quat, EE_T_C, T_M) if get_camera_to_unity_matrix else np.eye(4)
-                    
-                    T_offset  = get_rotation_matrix_scipy(180, 0, 0)
-                    #print(T_offset)
+                    # 3. 🌟 核心：绝对正确的物理连乘链条！(代码从右往左执行)
+                    # [相机系] -> EE_T_C -> [法兰系] -> ee_T_robot -> [基座系] -> F_z -> [高度翻转的基座系] -> T_M -> [Unity系]
+                    C_T_Unity = T_M @ F_z @ ee_T_robot @ EE_T_C
 
+                    # 4. (保持原有) Unity 侧如果需要绕 X 轴正过来，加上这个 Offset
+                    T_offset = get_rotation_matrix_scipy(0, 0, 0)
                     C_T_Unity_offset = C_T_Unity @ T_offset
 
-                    # 1. 调用算法获取当前帧的坐标 (目前算法会返回 59 个点)
+                    # 5. 调用算法获取当前帧的坐标 (传入我们算好的终极矩阵)
                     camera_coords, should_quit = Body3DSkeletonProcess_dual(C_T_Unity_offset, use_dual_camera=False)
-
                     
                     if not should_quit and camera_coords:
-                        # 2. 截取前 17 个身体关键点 (丢掉后面的手部点)
+                        # 6. 截取前 17 个身体关键点 (丢掉后面的手部点)
                         body_only_coords = camera_coords[:17]
                         
                         send_skeleton_data(conn, body_only_coords)
