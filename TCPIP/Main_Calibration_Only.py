@@ -113,16 +113,16 @@ except ImportError:
     tool_tip_to_ee = None
 
 try:
-    from camera2unity import get_camera_to_unity_matrix
+    import camera2unity
 except ImportError:
-    print("⚠️ Warning: camera2unity.py not found. No way to compute camera to unity matrix.")
-    get_camera_to_unity_matrix = None
+    print("⚠️ Warning: camera2unity.py not found. ")
+    camera2unity = None
 
 try:
-    from camera2unity import get_rotation_matrix_scipy
+    import RvisSkeletonBroacaster
 except ImportError:
-    print("⚠️ Warning: camera2unity.py not found. No way to compute rotation matrix.")
-    get_rotation_matrix_scipy = None
+    print("⚠️ Warning: RvisSkeletonBroacaster.py not found. ")
+    camera2unity = None
 # -------------------------------------------------
 # 2. 核心与辅助函数
 # -------------------------------------------------
@@ -294,6 +294,10 @@ def main():
 
     #Initialize the robot listener
     robot_listener = robotPositionListener.RobotPositionListener(port=5006)
+
+    #Initialize the RVIZ visualizer
+    rviz_broadcaster = RvisSkeletonBroacaster.RVizSkeletonBroadcaster(frame_id="panda_link0")
+
 
     sSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -515,8 +519,9 @@ def main():
                             print(f"\n   [Interpolation] 正在生成平滑路径...")
                             final_smooth_path = pathInterpolation.generate_smooth_path_with_orientation(
                                 path_with_orientations, 
-                                resolution=30
+                                resolution=3
                             )
+                            final_smooth_path.append(path_with_orientations[-1])
                             
                             # 5. 执行机器人运动
                             if robot is None: 
@@ -585,9 +590,10 @@ def main():
                             # 注意：你的插值函数需要更新，以支持 force 字段（见下文）
                             final_smooth_path = pathInterpolation.generate_smooth_path_with_orientation(
                                 path_with_force, 
-                                resolution=30
+                                resolution=3
                             )
                             
+                            final_smooth_path.append(path_with_force[-1])
                             # 5. 执行机器人运动
                             if robot is None: 
                                 robot = RobotController()
@@ -686,38 +692,33 @@ def main():
                 sender.send_frame(conn, sensor_type='c')
 
             if is_skeleton_streaming and Body3DSkeletonProcess_dual:
-                if T_M is not None:
-                    # 1. 提取机器人的实时位姿 (EE -> Base)
-                    ee_pos, ee_quat = robot_listener.get_current_pose()
-                    ee_T_robot = np.eye(4)
-                    ee_T_robot[:3, :3] = R.from_quat(ee_quat).as_matrix()
-                    ee_T_robot[:3, 3] = ee_pos
-
-                    # 2. 🌟 构造 Z 轴翻转矩阵 (关键：在 Base 和 T_M 之间翻转高度)
-                    F_z = np.eye(4)
-                    F_z[2, 2] = -1.0
-
-                    # 3. 🌟 核心：绝对正确的物理连乘链条！(代码从右往左执行)
-                    # [相机系] -> EE_T_C -> [法兰系] -> ee_T_robot -> [基座系] -> F_z -> [高度翻转的基座系] -> T_M -> [Unity系]
-                    C_T_Unity = T_M @ F_z @ ee_T_robot @ EE_T_C
-
-                    # 4. (保持原有) Unity 侧如果需要绕 X 轴正过来，加上这个 Offset
-                    T_offset = get_rotation_matrix_scipy(0, 0, 0)
-                    C_T_Unity_offset = C_T_Unity @ T_offset
-
-                    # 5. 调用算法获取当前帧的坐标 (传入我们算好的终极矩阵)
-                    camera_coords, should_quit = Body3DSkeletonProcess_dual(C_T_Unity_offset, use_dual_camera=False)
+                F_z = np.eye(4)
+                F_z[2, 2] = -1.0
+                skeleton_coord_camera, should_quit = Body3DSkeletonProcess_dual(F_z, use_dual_camera=False) #remain right-handed
+                #print("gained skeleton data from camera")
                     
-                    if not should_quit and camera_coords:
-                        # 6. 截取前 17 个身体关键点 (丢掉后面的手部点)
-                        body_only_coords = camera_coords[:17]
-                        
-                        send_skeleton_data(conn, body_only_coords)
-                else:
-                    # 防止疯狂打印，可以加个简单的限流，或者只提醒一次
-                    # print("⚠️ 骨架开关已开，但尚未进行相机校准 (T_M is None)！")
-                    pass
-                
+                if robot_listener is not None:
+                    # geting skeleton_coord_robot
+                    ee_pos, ee_quat = robot_listener.get_current_pose()
+                    skeleton_coord_robot = camera2unity.points_camera_to_robot(skeleton_coord_camera, ee_pos, ee_quat, EE_T_C)
+                    #print("transformed to robot coord")
+                    rviz_broadcaster.publish(skeleton_coord_robot)
+
+                    if T_M is not None:
+                        skeleton_coord_unity = camera2unity.points_camera_to_unity(skeleton_coord_camera, ee_pos, ee_quat, EE_T_C, T_M)
+                        #print("transformed to unity")
+
+                        if not should_quit and skeleton_coord_unity:
+                            # 6. 截取前 17 个身体关键点 (丢掉后面的手部点)
+                            body_only_coords = skeleton_coord_unity[:17]
+                            
+                            send_skeleton_data(conn, body_only_coords)
+                            
+                    else:
+                        # 防止疯狂打印，可以加个简单的限流，或者只提醒一次
+                        # print("⚠️ 骨架开关已开，但尚未进行相机校准 (T_M is None)！")
+                        pass
+                    
                 
     except Exception as e:
         print(f"[TCP] Server Error: {e}")

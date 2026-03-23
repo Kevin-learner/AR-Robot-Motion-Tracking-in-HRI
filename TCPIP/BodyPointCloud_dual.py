@@ -501,6 +501,12 @@ def process_skeleton_single(pipeline, pc, color_intrinsics_out, R=None, T=None):
         pose_3d =(R @  pose_3d.T).T + T
     return pose_2d, pose_3d, verts, texcoords, colors, color_image, depth_intrinsics, color_frame,depth_frame, points
 def Body3DSkeletonProcess_dual(T_M, use_dual_camera=False):
+    """
+    pram: 
+        T_M: calibrated transformation matrix robot(right-handed) -> unity(left-handed)
+    z = -z included
+    Transform the Nx3 dot matrix using the 4x4 transformation matrix T and output Nx3.
+    """
     color_intrinsics_list = []
 
     if use_dual_camera:
@@ -562,7 +568,7 @@ def Body3DSkeletonProcess_dual(T_M, use_dual_camera=False):
         pose_2d_1, pose_3d_1, verts_1, texcoords_1, colors_1, color_image_1, depth_intrinsics_1, mapped_frame_1, depth_frame_1, points_1 = result
 
         pose_3d_raw_1 = pose_3d_1.copy()
-        #pose_3d_1[:, 2] *= -1
+        pose_3d_1[:, 2] *= -1
         pose_3d_transformed_1 = transform_points(pose_3d_1, T_M)
         send_coords = [tuple(p) for p in pose_3d_transformed_1]
         send_coords = apply_kalman_filter_to_skeleton(send_coords, use_transform=False)
