@@ -92,3 +92,41 @@ def transform_unity_rot_to_robot(u_quat, T_M):
         'robot_rpy': robot_rpy,
         'raw_rpy': u_euler
     }
+def transform_robot_rot_to_unity(r_quat, T_M=None):
+    """
+    将机器人的姿态四元数转换为 Unity 的姿态四元数
+    (这是 transform_unity_rot_to_robot 的严格逆函数)
+    """
+    from scipy.spatial.transform import Rotation as R
+    import numpy as np
+
+    # 1. 构造机器人的当前实际姿态
+    R_robot = R.from_quat(r_quat)
+
+    # 2. 定义相同的基准姿态 (Franka 标准向下：180, 0, 0)
+    R_base = R.from_euler('xyz', [180, 0, 0], degrees=True)
+
+    # 3. 求解相对旋转
+    # R_robot = R_base * R_delta  =>  R_delta = R_base.inv() * R_robot
+    R_delta = R_base.inv() * R_robot
+
+    # 4. 提取相对旋转的欧拉角 (XYZ)
+    delta_euler = R_delta.as_euler('xyz', degrees=True)
+    delta_x, delta_y, delta_z = delta_euler[0], delta_euler[1], delta_euler[2]
+
+    # 5. 【逆向映射】解算 Unity 的 Euler 角
+    # 正向是: delta_x = u_z,  delta_y = -u_x, delta_z = u_y
+    # 所以逆向就是:
+    u_x = -delta_y
+    u_y = delta_z
+    u_z = delta_x
+
+    # 6. 生成 Unity 姿态
+    R_unity = R.from_euler('xyz', [u_x, u_y, u_z], degrees=True)
+    unity_quat = R_unity.as_quat()
+
+    return {
+        'unity_quat': unity_quat,
+        'unity_rpy': [u_x, u_y, u_z],
+        'robot_rpy': delta_euler # 返回相对 rpy 供调试观察
+    }

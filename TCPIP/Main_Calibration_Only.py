@@ -306,6 +306,10 @@ def main():
 
     is_skeleton_streaming = False
 
+    is_robot_state_streaming = False
+    robot_stream_rate = 30.0  # 30Hz
+    last_robot_stream_time = 0.0
+
     # [新增] 获取缓存文件路径
     TM_CACHE_PATH = config['alignment'].get('tm_cache_file', 'tm_matrix.npy')
     
@@ -663,12 +667,20 @@ def main():
             elif header == 'E': 
                 sender.is_streaming = False
                 print("⏹️ 停止传输")
+
             elif header == 'K': 
                 is_skeleton_streaming = True
                 print("▶️ 开始传输【骨架数据】")
             elif header == 'L': 
                 is_skeleton_streaming = False
                 print("⏹️ 停止传输【骨架数据】")
+            
+            elif header == 'J': 
+                is_robot_state_streaming = True
+                print("▶️ 开始以 30Hz 传输【全关节实时位姿】(Python端已转换)")
+            elif header == 'H': 
+                is_robot_state_streaming = False
+                print("⏹️ 停止传输【全关节实时位姿】")
 
             # ===============================================
             # CASE 'x': 退出 (Exit)
@@ -718,7 +730,49 @@ def main():
                         # 防止疯狂打印，可以加个简单的限流，或者只提醒一次
                         # print("⚠️ 骨架开关已开，但尚未进行相机校准 (T_M is None)！")
                         pass
-                    
+            
+            # --- 机械臂全关节实时状态流 (30Hz) ---
+            if is_robot_state_streaming and robot_listener is not None:
+                current_time = time.time()
+                if current_time - last_robot_stream_time >= (1.0 / robot_stream_rate):
+                    last_robot_stream_time = current_time
+                    try:
+                        # 假设 robot_listener 提供获取所有关节状态的方法
+                        # 返回值应该是包含7个元素的列表，每个元素包含(angle, pos, quat)
+                        joints_angles = robot_listener.get_joints() 
+                        joints_positions = robot_listener.get_all_joint_positions() 
+                        joints_quats = robot_listener.get_all_joint_quats()
+                        
+                        flat_data = []
+                        
+                        # 遍历 7 个关节，在 Python 端完成所有矩阵转换
+                        for i in range(7):
+                            angle = joints_angles[i]
+                            raw_pos = joints_positions[i]
+                            raw_quat = joints_quats[i]
+                            
+                            # 【核心】在这里提前应用 T_M 矩阵，并转换为 Unity 左手系
+                            if T_M is not None:
+                                unity_pos = rut.robot2unity_transform(raw_pos, T_M)
+                                # 假设你的 rut 模块有这个对应姿态的转换函数
+                                res = rut.transform_robot_rot_to_unity(raw_quat, T_M) 
+                                unity_quat = res['unity_quat'] 
+                            else:
+                                # 如果还没校准，就先发原数据或全0
+                                unity_pos = raw_pos
+                                unity_quat = raw_quat
+                                
+                            flat_data.append(float(angle))
+                            flat_data.extend([float(x) for x in unity_pos])
+                            flat_data.extend([float(x) for x in unity_quat])
+                            
+                        # 打包发送: 'j' + 56个小端序 float (共 225 bytes)
+                        header_j = b'j'
+                        payload_j = struct.pack('<56f', *flat_data)
+                        conn.sendall(header_j + payload_j)
+                        
+                    except Exception as e:
+                        pass
                 
     except Exception as e:
         print(f"[TCP] Server Error: {e}")
