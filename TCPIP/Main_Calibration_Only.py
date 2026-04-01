@@ -307,7 +307,7 @@ def main():
     is_skeleton_streaming = False
 
     is_robot_state_streaming = False
-    robot_stream_rate = 30.0  # 30Hz
+    robot_stream_rate = 10.0  # 30Hz
     last_robot_stream_time = 0.0
 
     # [新增] 获取缓存文件路径
@@ -746,7 +746,7 @@ def main():
                         flat_data = []
                         
                         # 遍历 7 个关节，在 Python 端完成所有矩阵转换
-                        for i in range(7):
+                        for i in range(8):
                             angle = joints_angles[i]
                             raw_pos = joints_positions[i]
                             raw_quat = joints_quats[i]
@@ -768,8 +768,12 @@ def main():
                             
                         # 打包发送: 'j' + 56个小端序 float (共 225 bytes)
                         header_j = b'j'
-                        payload_j = struct.pack('<56f', *flat_data)
+                        payload_j = struct.pack('<64f', *flat_data)
+
+                        conn.setblocking(True)
                         conn.sendall(header_j + payload_j)
+                        conn.setblocking(False)
+
                         
                     except Exception as e:
                         pass

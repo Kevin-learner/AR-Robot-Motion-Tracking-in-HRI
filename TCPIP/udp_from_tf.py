@@ -58,11 +58,13 @@ def main():
     # 🌟 新增：我们要获取的 7 个关节和 Link (最后一个使用传进来的 child_frame)
     joint_names = [
         "panda_joint1", "panda_joint2", "panda_joint3",
-        "panda_joint4", "panda_joint5", "panda_joint6", "panda_joint7"
+        "panda_joint4", "panda_joint5", "panda_joint6", "panda_joint7",
+        "dummy_joint"
     ]
     child_frames = [
         "panda_link1", "panda_link2", "panda_link3", 
-        "panda_link4", "panda_link5", "panda_link6", child 
+        "panda_link4", "panda_link5", "panda_link6", "panda_link7",
+        child 
     ]
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -123,18 +125,18 @@ def main():
                 
                 # 🌟 新增：打包 7 个关节全量数据 (56 个 float)
                 payload = []
-                for i in range(7):
+                for i in range(8):
                     j_name = joint_names[i]
                     link_name = child_frames[i]
                     
                     angle = latest_joint_angles.get(j_name, 0.0)
                     
-                    if i == 6: 
-                        # 第 7 个就是末端，直接使用上面经过平滑和死区判断的最终值
+                    if i == 7: 
+                        # 第 8 个就是末端，直接使用上面经过平滑和死区判断的最终值
                         link_x, link_y, link_z = x, y, z
                         link_qx, link_qy, link_qz, link_qw = qx, qy, qz, qw
                     else:
-                        # 获取前 6 个关节的 TF
+                        # 获取前 7 个关节的 TF
                         t_link = buf.lookup_transform(parent, link_name, rospy.Time(0), rospy.Duration(0.05))
                         link_x = t_link.transform.translation.x
                         link_y = t_link.transform.translation.y
@@ -147,7 +149,7 @@ def main():
                     payload.extend([angle, link_x, link_y, link_z, link_qx, link_qy, link_qz, link_qw])
 
                 # 🌟 打包 56 个 float (224 字节) 发送
-                pkt = struct.pack("!56f", *payload)
+                pkt = struct.pack("!64f", *payload)
                 sock.sendto(pkt, (target_ip, port))
                 seq += 1
                 
