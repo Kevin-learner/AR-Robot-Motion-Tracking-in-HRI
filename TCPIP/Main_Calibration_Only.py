@@ -535,6 +535,25 @@ def main():
                             # 发送给机械臂执行
                             robot.execute_path(final_smooth_path, speed=0.02)
 
+                            # 2. 🌟 关键：增加等待逻辑
+                            # 假设目标点是路径的最后一个点
+                            target_pos = final_smooth_path[-1]['pos'] 
+
+                            print(" ⏳ 等待机械臂到达目标位置...")
+                            while True:
+                                # 获取机械臂当前的实时位置 (你可以从你的 robot_listener 获取)
+                                current_pos = robot_listener.get_position() 
+                                
+                                if current_pos is not None:
+                                    # 计算当前位置与目标位置的欧氏距离
+                                    dist = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
+                                    
+                                    # 如果距离小于 1cm (0.01m)，认为已到达
+                                    if dist < 0.01: 
+                                        break
+                                        
+                                time.sleep(0.1) # 每 100ms 检查一次，避免占用过多 CPU
+
                             try:
                                 conn.sendall(b'm')
                                 print("   ✅ [TCP] 机械臂运动完毕，已向 HoloLens 发送 'm' 解锁信号")
@@ -611,6 +630,25 @@ def main():
                             print(f"   🚀 开始执行力控轨迹，总插值点数: {len(final_smooth_path)}")
                             # 统一使用 execute_path，不再需要传 mode 参数
                             robot.execute_path(final_smooth_path, speed=0.02)
+
+                            # 2. 🌟 关键：增加等待逻辑
+                            # 假设目标点是路径的最后一个点
+                            target_pos = final_smooth_path[-1]['pos'] 
+
+                            print(" ⏳ 等待机械臂到达目标位置...")
+                            while True:
+                                # 获取机械臂当前的实时位置 (你可以从你的 robot_listener 获取)
+                                current_pos = robot_listener.get_position() 
+                                
+                                if current_pos is not None:
+                                    # 计算当前位置与目标位置的欧氏距离
+                                    dist = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
+                                    
+                                    # 如果距离小于 1cm (0.01m)，认为已到达
+                                    if dist < 0.01: 
+                                        break
+                                        
+                                time.sleep(0.1) # 每 100ms 检查一次，避免占用过多 CPU
 
                             try:
                                 conn.sendall(b'm')
@@ -718,12 +756,30 @@ def main():
             if is_skeleton_streaming and Body3DSkeletonProcess_dual:
                 F_z = np.eye(4)
                 F_z[2, 2] = -1.0
-                skeleton_coord_camera, should_quit = Body3DSkeletonProcess_dual(F_z, use_dual_camera=False) #remain right-handed
-                #print("gained skeleton data from camera")
+                
                     
                 if robot_listener is not None:
                     # geting skeleton_coord_robot
                     ee_pos, ee_quat = robot_listener.get_current_pose()
+
+                    # 注意：如果你的机械臂不是绕 X 轴旋转导致画面倾斜，请把 [0] 改成 [2] (Z轴) 或 [1] (Y轴)
+                    from scipy.spatial.transform import Rotation as R
+                    euler_angles = R.from_quat(ee_quat).as_euler('xyz', degrees=True)
+                    current_ry = euler_angles[1]  # [1] 代表取出 Ry
+                    
+                    # 💡 设定基准角度：即相机画面正立时的 Ry 角度
+                    BASELINE_RY = -47.6 
+                    
+                    # 💡 计算图像到底歪了多少度
+                    roll_angle = current_ry - BASELINE_RY
+
+                    skeleton_coord_camera, should_quit = Body3DSkeletonProcess_dual(
+                        F_z,
+                        use_dual_camera=False,
+                        roll_angle = roll_angle
+                        ) #remain right-handed
+                    #print("gained skeleton data from camera")
+
                     skeleton_coord_robot = camera2unity.points_camera_to_robot(skeleton_coord_camera, ee_pos, ee_quat, EE_T_C)
                     #print("transformed to robot coord")
                     rviz_broadcaster.publish(skeleton_coord_robot)

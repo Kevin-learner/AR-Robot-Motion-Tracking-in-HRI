@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import threading
 from ultralytics import YOLO
+import cv2
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"YOLO pose on: {device}")
@@ -121,5 +122,82 @@ def convert_17YOLOpose_to_3d_with_fill(pose_2d, verts, image_shape, kernel_size=
 
     return pose_3d
 
+def rotate_image_and_get_matrix(image, angle_deg):
+    """
+    将图像绕中心点旋转，并返回旋转后的图像和变换矩阵
+    """
+    h, w = image.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    
+    # 获取 2D 旋转矩阵 (尺度为 1.0)
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    
+    # 执行旋转 (保持原图尺寸)
+    rotated_img = cv2.warpAffine(image, M, (w, h))
+    
+    return rotated_img, M
 
+def inverse_rotate_keypoints(keypoints, M):
+    """
+    将 YOLO 在旋转图上找出的 2D 坐标，逆向旋转回原始相机画面
+    """
+    # 求旋转矩阵的逆矩阵
+    M_inv = cv2.invertAffineTransform(M)
+    
+    restored_keypoints = []
+    IMG_W = 640
+    IMG_H = 480
+    
+    for pt in keypoints:
+        # 如果是无效点 (0,0)，保持不变
+        if pt[0] == 0 and pt[1] == 0:
+            restored_keypoints.append([0.0, 0.0])
+            continue
+            
+        # 组装齐次坐标 [u, v, 1]
+        p_hom = np.array([pt[0], pt[1], 1.0])
+        # 矩阵乘法还原坐标
+        p_restored = M_inv @ p_hom
+
+        x = np.clip(p_restored[0], 0, IMG_W - 1)
+        y = np.clip(p_restored[1], 0, IMG_H - 1)
+
+        restored_keypoints.append([x, y])        
+    return np.array(restored_keypoints, dtype=np.float32)
+
+def YOLOposeDetect_with_rotation(color_image, roll_angle=0.0):
+    """
+    带数字云台抗旋转的 YOLO 推理
+    :param roll_angle: 相机绕光轴的旋转角度 (度数)。如果是正着，传 0。
+    """
+    # 1. 如果相机歪了，先把图像拧正
+    if abs(roll_angle) > 5.0:  # 超过 5 度才触发旋转，节省算力
+        img_to_infer, M = rotate_image_and_get_matrix(color_image, roll_angle)
+    else:
+        img_to_infer = color_image
+        M = None
+
+    # 2. 送入 YOLO 进行推理 (YOLO 现在看到的是正立的人)
+    model_pose = get_model_pose()
+    results = model_pose(img_to_infer, verbose=False)
+
+    pose_2d = np.zeros((17, 2), dtype=np.float32)
+    if len(results[0].boxes) == 0 or results[0].keypoints is None:
+        return pose_2d
+
+    confidences = results[0].boxes.conf.data
+    max_conf_index = torch.argmax(confidences)
+    if confidences[max_conf_index].item() < 0.75:
+        return pose_2d
+
+    # 拿到基于“正立图像”的 2D 坐标
+    keypoints_xy = results[0].keypoints.xy[max_conf_index].cpu().numpy().astype(np.float32)
+
+    # 3. 🌟 关键：如果之前旋转了图像，现在必须把点转回真实的歪斜状态！
+    if M is not None:
+        pose_2d = inverse_rotate_keypoints(keypoints_xy, M)
+    else:
+        pose_2d = keypoints_xy
+
+    return pose_2d
 

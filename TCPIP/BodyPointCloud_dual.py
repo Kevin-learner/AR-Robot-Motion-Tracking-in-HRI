@@ -4,7 +4,7 @@ import math
 import time
 import numpy as np
 from segment_and_crop import segment_and_crop
-from yolo_pose_3d import YOLOposeDetect, convert_17YOLOpose_to_3d_with_fill
+from yolo_pose_3d import YOLOposeDetect, convert_17YOLOpose_to_3d_with_fill, YOLOposeDetect_with_rotation
 from scipy.spatial import Delaunay
 from sklearn.decomposition import PCA
 import concurrent.futures
@@ -447,7 +447,7 @@ def fuse_keypoints_with_confidence(send_list_1, send_list_2, conf_list_1, conf_l
         fused.append(tuple(fused_point))
 
     return fused
-def process_skeleton_single(pipeline, pc, color_intrinsics_out, R=None, T=None):
+def process_skeleton_single(pipeline, pc, color_intrinsics_out, R=None, T=None, roll_angle = 0):
 
     frames = pipeline.wait_for_frames()
     align = rs.align(rs.stream.color)
@@ -477,7 +477,8 @@ def process_skeleton_single(pipeline, pc, color_intrinsics_out, R=None, T=None):
     texcoords = texcoords.reshape(h * w, 2)
 
     start_time = time.time()  # 开始计时
-    pose_2d_yolo = YOLOposeDetect(color_image)
+    #pose_2d_yolo = YOLOposeDetect(color_image)
+    pose_2d_yolo = YOLOposeDetect_with_rotation(color_image, roll_angle=roll_angle)
     end_time = time.time()  # 结束计时
     capture_time = end_time - start_time
     # print(f"YOLOdelay: {capture_time:.4f} seconds")
@@ -500,7 +501,7 @@ def process_skeleton_single(pipeline, pc, color_intrinsics_out, R=None, T=None):
         verts = (R @ verts.T).T + T
         pose_3d =(R @  pose_3d.T).T + T
     return pose_2d, pose_3d, verts, texcoords, colors, color_image, depth_intrinsics, color_frame,depth_frame, points
-def Body3DSkeletonProcess_dual(T_M, use_dual_camera=False):
+def Body3DSkeletonProcess_dual(T_M, use_dual_camera=False, roll_angle=0.0):
     """
     pram: 
         T_M: calibrated transformation matrix robot(right-handed) -> unity(left-handed)
@@ -512,8 +513,8 @@ def Body3DSkeletonProcess_dual(T_M, use_dual_camera=False):
     if use_dual_camera:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            future1 = executor.submit(process_skeleton_single, pipeline_1, pc_1, color_intrinsics_list,None, None)
-            future2 = executor.submit(process_skeleton_single, pipeline_2, pc_2, color_intrinsics_list, R, T)
+            future1 = executor.submit(process_skeleton_single, pipeline_1, pc_1, color_intrinsics_list,None, None, roll_angle)
+            future2 = executor.submit(process_skeleton_single, pipeline_2, pc_2, color_intrinsics_list, R, T, roll_angle)
             result1 = future1.result()
             result2 = future2.result()
 
@@ -549,7 +550,7 @@ def Body3DSkeletonProcess_dual(T_M, use_dual_camera=False):
 
     else:
 
-        result = process_skeleton_single(pipeline_1, pc_1, color_intrinsics_list)
+        result = process_skeleton_single(pipeline_1, pc_1, color_intrinsics_list, None, None, roll_angle)
         if result[0] is None:
             print("🛑 [Mono] No person detected, sending zeros.")
 
