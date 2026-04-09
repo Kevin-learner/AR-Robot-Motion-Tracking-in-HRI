@@ -534,6 +534,12 @@ def main():
                             print(f"   🚀 开始执行，总插值点数: {len(final_smooth_path)}")
                             # 发送给机械臂执行
                             robot.execute_path(final_smooth_path, speed=0.02)
+
+                            try:
+                                conn.sendall(b'm')
+                                print("   ✅ [TCP] 机械臂运动完毕，已向 HoloLens 发送 'm' 解锁信号")
+                            except Exception as e:
+                                print(f"   ❌ 发送完成信号失败: {e}")
                     else:
                         print("   ⚠️ T_M 矩阵为空，请先进行校准发送 'c'！")
                     print("="*50 + "\n")
@@ -605,6 +611,12 @@ def main():
                             print(f"   🚀 开始执行力控轨迹，总插值点数: {len(final_smooth_path)}")
                             # 统一使用 execute_path，不再需要传 mode 参数
                             robot.execute_path(final_smooth_path, speed=0.02)
+
+                            try:
+                                conn.sendall(b'm')
+                                print("   ✅ [TCP] 机械臂力控运动完毕，已向 HoloLens 发送 'm' 解锁信号")
+                            except Exception as e:
+                                print(f"   ❌ 发送完成信号失败: {e}")
                     else:
                         print("   ⚠️ T_M 矩阵为空，请先进行校准发送 'c'！")
                     print("="*50 + "\n")
