@@ -154,12 +154,10 @@ def main():
                 seq += 1
                 
                 # 完全保留你原有的打印日志逻辑
-                if updated:
-                    rospy.loginfo("sent #%d UPDATED d=%.6f xyz=(%.4f, %.4f, %.4f) Euler[Deg]=(Rx:%.1f, Ry:%.1f, Rz:%.1f) q=(%.2f, %.2f, %.2f, %.2f)", 
+                
+                rospy.loginfo("sent #%d UPDATED d=%.6f xyz=(%.4f, %.4f, %.4f) Euler[Deg]=(Rx:%.1f, Ry:%.1f, Rz:%.1f) q=(%.2f, %.2f, %.2f, %.2f)", 
                                   seq, d, x, y, z, rx_deg, ry_deg, rz_deg, qx, qy, qz, qw)
-                else:
-                    rospy.loginfo("sent #%d HOLD    d=%.6f xyz=(%.4f, %.4f, %.4f) Euler[Deg]=(Rx:%.1f, Ry:%.1f, Rz:%.1f)", 
-                                  seq, d, x, y, z, rx_deg, ry_deg, rz_deg)
+                
             else:
                 pass
 

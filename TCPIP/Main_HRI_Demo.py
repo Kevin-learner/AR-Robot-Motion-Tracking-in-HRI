@@ -7,6 +7,7 @@ import sys
 import time
 import cv2
 from scipy.spatial.transform import Rotation as R
+from collections import deque
 
 # netsh interface portproxy add v4tov4 listenaddress=192.168.137.1 listenport=[本地监听端口] connectaddress=[机械臂的Tailscale IP] connectport=[机械臂服务端口]
 
@@ -283,44 +284,47 @@ def send_skeleton_data(conn, send_coords):
 
 def check_reach_intent(skeleton_coord_camera):
     """
-    通过 3D 骨骼坐标判断人是否在“伸手指向桌面”
+    通过 3D 骨骼坐标判断人是否在“伸手” (适配 YOLO 17点格式)
     """
-    if skeleton_coord_camera is None or len(skeleton_coord_camera) < 8:
+    if skeleton_coord_camera is None or len(skeleton_coord_camera) < 11:
         return False
         
-    # 假设你的骨骼点索引：1-脖子, 2-右肩, 3-右肘, 4-右手腕, 5-左肩, 6-左肘, 7-左手腕
-    # 请根据你实际的模型 (比如 COCO 17点 或 MediaPipe) 调整 index！
-    idx_neck = 1
-    idx_r_shoulder = 2
-    idx_r_wrist = 4
+    pts = np.array(skeleton_coord_camera)
+    
+    # YOLO COCO 索引
+    idx_nose = 0
     idx_l_shoulder = 5
-    idx_l_wrist = 7
+    idx_r_shoulder = 6
+    idx_l_wrist = 9
+    idx_r_wrist = 10
     
-    neck = skeleton_coord_camera[idx_neck]
-    r_shoulder = skeleton_coord_camera[idx_r_shoulder]
-    r_wrist = skeleton_coord_camera[idx_r_wrist]
-    l_shoulder = skeleton_coord_camera[idx_l_shoulder]
-    l_wrist = skeleton_coord_camera[idx_l_wrist]
+    nose = pts[idx_nose]
+    l_shoulder = pts[idx_l_shoulder]
+    r_shoulder = pts[idx_r_shoulder]
+    l_wrist = pts[idx_l_wrist]
+    r_wrist = pts[idx_r_wrist]
     
-    # 1. 计算手腕到对应肩膀的三维欧氏距离 (代表手臂伸展程度)
-    r_arm_extend = np.linalg.norm(r_wrist - r_shoulder)
-    l_arm_extend = np.linalg.norm(l_wrist - l_shoulder)
+    # 过滤掉丢失的点
+    if np.allclose(l_shoulder, [0,0,0]) or np.allclose(r_shoulder, [0,0,0]):
+        return False
+
+    # 1. 计算手腕到肩膀的三维长度
+    l_arm_extend = np.linalg.norm(l_wrist - l_shoulder) if not np.allclose(l_wrist, [0,0,0]) else 0.0
+    r_arm_extend = np.linalg.norm(r_wrist - r_shoulder) if not np.allclose(r_wrist, [0,0,0]) else 0.0
     
-    # 2. 判断手腕的深度 (Z轴) 是否明显比身体更往前
-    # 你的 F_z 设定可能导致相机的 Z 是指向人体的（Z越小越靠近相机），请根据实际输出的符号测试
-    # 这里假设：伸手时，手腕的 Z 会比肩膀的 Z 更小（更靠近镜头）或者具有显著差异
-    z_diff_r = r_shoulder[2] - r_wrist[2] 
+    # 2. 判断手腕的 Z 深度 (手是否伸向了相机前方)
+    # 伸得越前，Z 值通常越小或者呈现特定方向的差值
     z_diff_l = l_shoulder[2] - l_wrist[2]
+    z_diff_r = r_shoulder[2] - r_wrist[2] 
     
-    # === 判定条件 (阈值需要你在实际运行时稍微调试一下) ===
-    # 假设：手臂伸展长度大于 0.45 米，且 Z 轴往前伸出超过 0.3 米
-    EXTEND_THRESHOLD = 0.45 
-    Z_FORWARD_THRESHOLD = 0.30
+    # 阈值：手臂伸长超过 0.35m，且向前伸超过 0.2m
+    EXTEND_THRESHOLD = 0.35 
+    Z_FORWARD_THRESHOLD = 0.20
     
-    right_reaching = (r_arm_extend > EXTEND_THRESHOLD) and (abs(z_diff_r) > Z_FORWARD_THRESHOLD)
     left_reaching = (l_arm_extend > EXTEND_THRESHOLD) and (abs(z_diff_l) > Z_FORWARD_THRESHOLD)
+    right_reaching = (r_arm_extend > EXTEND_THRESHOLD) and (abs(z_diff_r) > Z_FORWARD_THRESHOLD)
     
-    return right_reaching or left_reaching
+    return left_reaching or right_reaching
 
 # -------------------------------------------------
 # 3. 主循环
@@ -374,14 +378,13 @@ def main():
     hri_start_time = 0.0     # 记录状态切换的时间，用于非阻塞等待
     
     # 定义机械臂初始观测位姿 (请替换为你实际的关节角或笛卡尔坐标)
-    INIT_POSE = [0.4, 0.0, 0.4, 3.14, 0.0, 0.0] 
-    
-    # 1. State Tracking 的 PID 参数 (需要调试)
+    INIT_POSE = [0.3572, 0.0073, 0.5586, -0.68, 0.27, -0.63, 0.26]    # 1. State Tracking 的 PID 参数 (需要调试)
     KP_X = 0.5 
     KP_Y = 0.5
     DEADZONE_M = 0.05 # 5cm死区，人在画面中心 5cm 内机械臂不动
 
-    LOOK_AT_TABLE_POSE = [0.45, 0.0, 0.35, 3.14, 0.5, 0.0]
+    intent_history = deque(maxlen=30)
+    LOOK_AT_TABLE_POSE = [0.2766, 0.5236, 0.4433, -0.95, -0.32, -0.01, 0.05]
     # ===============================
 
     try:
@@ -933,65 +936,107 @@ def main():
                     if hri_start_time == 0.0:
                         print("🔄 [HRI] 状态 0: 机械臂前往初始观测位姿...")
                         if robot is not None:
-                            robot.move_to(INIT_POSE, speed=0.02)
+                            robot.move_to(INIT_POSE, speed=0.05)
                         hri_start_time = time.time() # 🌟 开始计时！
                         
                     # 每次循环检查时间是否够了，如果没够就直接跳过，继续发视频
                     else:
-                        if time.time() - hri_start_time > 5.0:
+                        if time.time() - hri_start_time > 20.0:
                             print(" ✅ [HRI] 5秒已过，假设已到达初始位置，切入人体跟踪状态！")
+                            if robot is not None:
+                                robot.start_tracking()
                             current_hri_state = STATE_TRACKING
                             hri_start_time = 0.0 # 重置计时器，给以后的状态用
-                
-                # 1. 跟踪状态：持续接收骨架数据，计算误差并喂给 PID 控制器
+                    
+                # -----------------------------------
+                # 状态 1：视觉伺服跟踪人体
+                # -----------------------------------
                 elif current_hri_state == STATE_TRACKING:
                     
-                    # 确保在前面的逻辑中，skeleton_coord_camera 已经获取到了
-                    if skeleton_coord_camera is not None and len(skeleton_coord_camera) > 1:
+                    # YOLO 至少需要 11 个点才能拿到左右手腕 (Index 9, 10)
+                    if skeleton_coord_camera is not None and len(skeleton_coord_camera) > 10:
                         
-                        # 【新增】：在这里高频检测“伸手”意图
-                        if check_reach_intent(skeleton_coord_camera):
-                            print(" 🎯 [HRI] 检测到伸手意图！准备看向桌面...")
-                            # 1. 停止 PID 跟踪
-                            if robot is not None:
-                                robot.stop_tracking()
-                            # 2. 切入状态 2
-                            current_hri_state = STATE_CHECK_INTENT
-                            hri_start_time = 0.0 # 重置计时器
-                            continue # 直接跳过本次循环后续的跟踪代码
+            # 🌟【全新防抖逻辑】：不再一帧定生死，而是塞入时间窗口
+                        current_intent = check_reach_intent(skeleton_coord_camera)
+                        intent_history.append(current_intent)
                         
-                        # 提取胸口或脖子的 3D 坐标 (假设 Index 1 是脖子)
-                        # 注意：这是在相机坐标系下的 3D 坐标，单位通常是米 (m)
-                        target_cam = skeleton_coord_camera[1] 
-                        
-                        cam_x = target_cam[0] # 相机画面左右偏差
-                        cam_y = target_cam[1] # 相机画面上下偏差
-                        # cam_z = target_cam[2] # 离相机的远近距离
-                        
-                        # 💡【极其关键：轴向映射】
-                        # 你的机械臂 PID 是在 Base (基座) 坐标系下移动的。
-                        # 我们必须把相机的左右上下，映射成基座的前后左右。
-                        # 假设初始姿态下，相机正视前方 (Base X正向)，那么：
-                        # - 人在画面偏右 (cam_x > 0) -> 机械臂需要向右移动 -> 对应 Base 的 -Y 方向
-                        # - 人在画面偏下 (cam_y > 0) -> 机械臂需要向下移动 -> 对应 Base 的 -Z 方向
-                        # (⚠️ 注意：这里的映射完全取决于你的实际硬件安装方向，请根据测试情况修改正负号和 XYZ 对应关系)
-                        
-                        base_err_x = 0.0       # 前后距离暂不跟踪，保持为0
-                        base_err_y = -cam_x    # 将相机的左右映射给 Base 的 Y
-                        base_err_z = -cam_y    # 将相机的上下映射给 Base 的 Z
-                        
-                        # 设置死区：如果人在画面中心 5cm (0.05m) 范围内，不要乱动防抖
-                        if abs(base_err_y) < 0.05: base_err_y = 0.0
-                        if abs(base_err_z) < 0.05: base_err_z = 0.0
-                        
-                        # 🚀 关键调用 2：高频喂给底层的 PID 误差
-                        if robot is not None:
-                            robot.update_tracking_error(base_err_x, base_err_y, base_err_z)
+                        # 只有当队列填满了（时间窗口满了），才开始计算比例
+                        if len(intent_history) == intent_history.maxlen:
+                            # 统计窗口内 True 的个数
+                            true_count = sum(intent_history)
+                            true_ratio = true_count / len(intent_history)
                             
+                            # 如果超过 80% 的帧都判定为伸手
+                            if true_ratio >= 0.8:
+                                print(f" 🎯 [HRI] 连续确认伸手意图 (置信度: {true_ratio*100:.1f}%)！停止跟踪，准备看向桌面...")
+                                
+                                if robot is not None:
+                                    robot.stop_tracking() 
+                                
+                                current_hri_state = STATE_CHECK_INTENT 
+                                hri_start_time = 0.0 
+                                
+                                # ⚠️ 非常重要：切入下一个状态前，清空历史队列！
+                                # 防止未来如果切回状态 1 时，旧的残留数据导致瞬间误触发
+                                intent_history.clear() 
+                                
+                                continue # 跳过本次循环的 PID 跟踪
+
+                        # --- 以下是正常的 YOLO 物理 3D 坐标 PID 跟踪 ---
+                        l_shoulder = np.array(skeleton_coord_camera[5])
+                        r_shoulder = np.array(skeleton_coord_camera[6])
+                        
+                        # 过滤无效点 (0,0,0)
+                        if np.linalg.norm(l_shoulder) > 0.1 and np.linalg.norm(r_shoulder) > 0.1:
+                            # 计算胸口中心点真实的 3D 坐标 (单位：米)
+                            chest_3d = (l_shoulder + r_shoulder) / 2.0
+                            
+                            cam_x = chest_3d[0] # 单位：米
+                            cam_y = chest_3d[1] # 单位：米
+
+                            # 🐞 【核心 DEBUG 1】：看看相机到底输出了什么级别的坐标
+                            print(f"👀 [视觉测距] 胸口物理坐标: X={cam_x:.4f}m, Y={cam_y:.4f}m, 深度Z={chest_3d[2]:.4f}m")
+                            
+                            # 轴向映射
+                            base_err_x = 0.0       
+                            base_err_y = -cam_x    
+                            base_err_z = 0.0 #-cam_y    
+                            
+                            # 死区改成物理尺寸 (0.03代表3厘米)
+                            if abs(base_err_y) < 0.03: base_err_y = 0.0
+                            if abs(base_err_z) < 0.03: base_err_z = 0.0
+                            
+                            if robot is not None:
+                                robot.update_tracking_error(base_err_x, base_err_y, base_err_z)
+                        else:
+                            if robot is not None: robot.update_tracking_error(0.0, 0.0, 0.0)
                     else:
-                        # 视野里没有识别到人，喂入 0 误差，机械臂会在原地悬停
+                        if robot is not None: robot.update_tracking_error(0.0, 0.0, 0.0)
+                        intent_history.append(False)
+                
+
+
+                # -----------------------------------
+                # 状态 2：机器人看向手伸出的方向（桌面）
+                # -----------------------------------
+                elif current_hri_state == STATE_CHECK_INTENT:
+                    
+                    if hri_start_time == 0.0:
+                        print("👀 [HRI] 状态 2: 机械臂低头，看向桌面目标区域...")
                         if robot is not None:
-                            robot.update_tracking_error(0.0, 0.0, 0.0)
+                            # 前往我们预设好的桌面观测点
+                            # 请确保在 main() 开头定义了 LOOK_AT_TABLE_POSE = [x, y, z, qx, qy, qz, qw]
+                            #pass
+                            robot.move_to(LOOK_AT_TABLE_POSE, speed=0.05)
+                            
+                        hri_start_time = time.time()
+                        
+                    else:
+                        # 非阻塞等待机械臂走到位 (这里给 4 秒时间，可根据实际距离调整)
+                        if time.time() - hri_start_time > 4.0:
+                            print(" ✅ [HRI] 视线已锁定桌面！准备进入物品识别 (State 3)...")
+                            current_hri_state = STATE_SCAN_OBJECTS
+                            hri_start_time = 0.0
                 
     except Exception as e:
         print(f"[TCP] Server Error: {e}")

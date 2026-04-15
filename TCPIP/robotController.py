@@ -6,7 +6,7 @@ import geometry_msgs.msg
 import tf
 import math
 from queue import Queue
-from tf.transformations import quaternion_slerp
+from tf.transformations import quaternion_slerp, quaternion_about_axis, quaternion_multiply
 
 class RobotController:
     def __init__(self):
@@ -31,26 +31,26 @@ class RobotController:
         self.target_speed = 0.05  # 5厘米/秒
         self.rate_hz = 100.0      # Motion Controller 通常 100Hz 足够，太高可能抖动
 
+        # ====================================================
+        # 🚀【全新炮台模式】视觉伺服 PID 专用变量 
+        # ====================================================
+        self.is_tracking = False
+        self.track_start_p = None # 记录追踪起步时的绝对位置
+        self.track_start_r = None # 记录追踪起步时的绝对姿态
+        
+        self.base_yaw = 0.0       # 记录基座需要旋转的总角度 (弧度)
+        self.current_error_y = 0.0 # 我们现在只关心左右水平误差！
+        
+        # 旋转 PID 参数 (角速度控制)
+        self.Kp_yaw = 0.5         # 比例系数 (误差转角速度，需调试)
+        self.max_yaw_vel = 0.2   # 最大旋转角速度 0.3 rad/s (约 17度/秒，非常稳)
+        self.current_yaw_vel = 0.0 # 当前平滑角速度
+        self.max_yaw_accel = 0.4  # 最大角加速度 0.4 rad/s^2 (极致平滑起步)
+
         self.worker_thread = threading.Thread(target=self._tape_player_executor)
         self.worker_thread.setDaemon(True)
         self.worker_thread.start()
 
-        # ====================================================
-        # [新增] 视觉伺服 PID 专用变量 (原有功能不受影响)
-        # ====================================================
-        self.is_tracking = False
-        self.track_target_p = None
-        self.track_target_r = None
-        self.current_error = np.array([0.0, 0.0, 0.0])
-        
-        # PID 参数矩阵 [X, Y, Z]
-        self.Kp = np.array([0.0005, 0.0005, 0.0005]) 
-        self.Ki = np.array([0.0, 0.0, 0.0]) 
-        self.Kd = np.array([0.0001, 0.0001, 0.0001])
-        
-        self.integral = np.array([0.0, 0.0, 0.0])
-        self.prev_error = np.array([0.0, 0.0, 0.0])
-        self.max_tracking_vel = 0.1 # 安全限速 0.1m/s
 
         print(f"⏳ [Robot] 等待 TF 变换...")
         try:
@@ -144,57 +144,77 @@ class RobotController:
                 self.path_queue.task_done()
                 should_publish = True
             
-            # --- 优先级 2：新增的视觉伺服跟踪逻辑 ---
-            elif self.is_tracking and self.track_target_p is not None:
-                err = self.current_error
+                # --- 优先级 2：炮台视觉伺服模式 (仅绕基座 Z 轴旋转) ---
+            elif self.is_tracking and self.track_start_p is not None:
+                # 1. 计算目标角速度
+                target_yaw_vel = self.Kp_yaw * self.current_error_y
+                target_yaw_vel = np.clip(target_yaw_vel, -self.max_yaw_vel, self.max_yaw_vel)
                 
-                # PID 计算
-                P_out = self.Kp * err
-                self.integral += err * dt
-                self.integral = np.clip(self.integral, -1000, 1000) 
-                I_out = self.Ki * self.integral
-                derivative = (err - self.prev_error) / dt
-                D_out = self.Kd * derivative
-                self.prev_error = err
+                # 2. 角加速度限幅 (物理减震器)
+                max_dv = self.max_yaw_accel * dt 
+                if target_yaw_vel > self.current_yaw_vel + max_dv:
+                    self.current_yaw_vel += max_dv
+                elif target_yaw_vel < self.current_yaw_vel - max_dv:
+                    self.current_yaw_vel -= max_dv
+                else:
+                    self.current_yaw_vel = target_yaw_vel
                 
-                vel = P_out + I_out + D_out
-                vel = np.clip(vel, -self.max_tracking_vel, self.max_tracking_vel)
+                # 3. 积分得到当前基座需要旋转的总角度
+                self.base_yaw += self.current_yaw_vel * dt
                 
-                # 积分计算出目标位移
-                self.track_target_p += vel * dt
+                # 🌟 4. 核心数学魔法：将起始位姿绕 Base 的 Z 轴旋转 base_yaw 角度 🌟
+                cos_a = math.cos(self.base_yaw)
+                sin_a = math.sin(self.base_yaw)
                 
-                msg.pose.position.x = self.track_target_p[0]
-                msg.pose.position.y = self.track_target_p[1]
-                msg.pose.position.z = self.track_target_p[2]
+                # 旋转 X 和 Y 坐标 (Z 坐标保持绝对不变！)
+                new_px = cos_a * self.track_start_p[0] - sin_a * self.track_start_p[1]
+                new_py = sin_a * self.track_start_p[0] + cos_a * self.track_start_p[1]
+                new_pz = self.track_start_p[2] 
                 
-                # 保持启动时的姿态不变
-                msg.pose.orientation.x = self.track_target_r[0]
-                msg.pose.orientation.y = self.track_target_r[1]
-                msg.pose.orientation.z = self.track_target_r[2]
-                msg.pose.orientation.w = self.track_target_r[3]
+                # 旋转四元数姿态
+                # 生成一个纯绕 Z 轴旋转的四元数
+                q_z_rotation = quaternion_about_axis(self.base_yaw, (0, 0, 1))
+                # 将旋转四元数应用到初始姿态上
+                new_r = quaternion_multiply(q_z_rotation, self.track_start_r)
+                
+                msg.pose.position.x = new_px
+                msg.pose.position.y = new_py
+                msg.pose.position.z = new_pz
+                msg.pose.orientation.x = new_r[0]
+                msg.pose.orientation.y = new_r[1]
+                msg.pose.orientation.z = new_r[2]
+                msg.pose.orientation.w = new_r[3]
                 
                 should_publish = True
-
+                
+                # 打印当前角速度 (调试用)
+                # if abs(self.current_yaw_vel) > 0.001:
+                #     print(f"🎯 [炮台模式] 角速度: {self.current_yaw_vel:.4f} rad/s | 总旋转角度: {math.degrees(self.base_yaw):.2f}°")
             # 如果有数据就发布
             if should_publish:
                 self.pub.publish(msg)
                 
             rate.sleep()
 
-    # ====================================================
-    # [新增] 视觉伺服专用接口
-    # ====================================================
     def start_tracking(self):
-        """开启跟踪模式"""
+        """开启炮台跟踪模式"""
+        print("⏳ [Robot] 收到 start_tracking 调用，正在获取起始位姿...")
         p, r = self.get_current_pose()
         if p is not None:
-            self.track_target_p = p.copy()
-            self.track_target_r = r.copy() # 锁定启动时的姿态
-            self.integral.fill(0.0)
-            self.prev_error.fill(0.0)
-            self.current_error.fill(0.0)
+            # 锁定起步坐标！在接下来的追踪中，机械臂其实是以这个位姿为刚体转动的
+            self.track_start_p = p.copy()
+            self.track_start_r = r.copy() 
+            
+            self.base_yaw = 0.0       # 角度清零
+            self.current_yaw_vel = 0.0 # 速度清零
+            self.current_error_y = 0.0 # 误差清零
+            
+            with self.path_queue.mutex:
+                self.path_queue.queue.clear()
             self.is_tracking = True
-            print("👁️ [Robot] 视觉 PID 跟踪模式已启动 (队列空闲时接管)")
+            print("👁️ [Robot] 成功！炮台跟踪模式已启动！(仅旋转 Joint 1)")
+        else:
+            print("❌ [Robot] 获取起始位姿失败！")
 
     def stop_tracking(self):
         """停止跟踪模式"""
@@ -204,5 +224,12 @@ class RobotController:
     def update_tracking_error(self, err_x, err_y, err_z=0.0):
         """更新图像误差"""
         if self.is_tracking:
-            self.current_error = np.array([err_x, err_y, err_z])
-    # ====================================================
+            # 炮台模式只关心水平误差 (左右平移)，我们把 err_y 喂给它
+            self.current_error_y = err_y
+
+    def move_to(self, pose, speed=None):
+        if pose is None or len(pose) != 7: return
+        target_pos = pose[0:3]
+        target_rot = pose[3:7]
+        path_list = [{'pos': target_pos, 'rot': target_rot}]
+        self.execute_path(path_list, speed)
