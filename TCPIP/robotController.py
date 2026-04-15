@@ -35,6 +35,23 @@ class RobotController:
         self.worker_thread.setDaemon(True)
         self.worker_thread.start()
 
+        # ====================================================
+        # [新增] 视觉伺服 PID 专用变量 (原有功能不受影响)
+        # ====================================================
+        self.is_tracking = False
+        self.track_target_p = None
+        self.track_target_r = None
+        self.current_error = np.array([0.0, 0.0, 0.0])
+        
+        # PID 参数矩阵 [X, Y, Z]
+        self.Kp = np.array([0.0005, 0.0005, 0.0005]) 
+        self.Ki = np.array([0.0, 0.0, 0.0]) 
+        self.Kd = np.array([0.0001, 0.0001, 0.0001])
+        
+        self.integral = np.array([0.0, 0.0, 0.0])
+        self.prev_error = np.array([0.0, 0.0, 0.0])
+        self.max_tracking_vel = 0.1 # 安全限速 0.1m/s
+
         print(f"⏳ [Robot] 等待 TF 变换...")
         try:
             self.tf_listener.waitForTransform(self.base_frame, self.ee_frame, rospy.Time(0), rospy.Duration(5.0))
@@ -104,25 +121,88 @@ class RobotController:
 
     def _tape_player_executor(self):
         rate = rospy.Rate(self.rate_hz)
+        dt = 1.0 / self.rate_hz # 新增时间步长用于积分
         msg = geometry_msgs.msg.PoseStamped()
         msg.header.frame_id = self.base_frame
         
         while self.is_running and not rospy.is_shutdown():
+            msg.header.stamp = rospy.Time.now()
+            should_publish = False
+            
+            # --- 优先级 1：原有的离散轨迹执行逻辑 (完全保留) ---
             if not self.path_queue.empty():
                 goal_p, goal_r = self.path_queue.get()
                 
-                # --- 运动控制器核心：直接发布目标位姿 ---
-                msg.header.stamp = rospy.Time.now()
                 msg.pose.position.x = goal_p[0]
                 msg.pose.position.y = goal_p[1]
                 msg.pose.position.z = goal_p[2]
-                
                 msg.pose.orientation.x = goal_r[0]
                 msg.pose.orientation.y = goal_r[1]
                 msg.pose.orientation.z = goal_r[2]
                 msg.pose.orientation.w = goal_r[3]
                 
-                self.pub.publish(msg)
                 self.path_queue.task_done()
+                should_publish = True
             
+            # --- 优先级 2：新增的视觉伺服跟踪逻辑 ---
+            elif self.is_tracking and self.track_target_p is not None:
+                err = self.current_error
+                
+                # PID 计算
+                P_out = self.Kp * err
+                self.integral += err * dt
+                self.integral = np.clip(self.integral, -1000, 1000) 
+                I_out = self.Ki * self.integral
+                derivative = (err - self.prev_error) / dt
+                D_out = self.Kd * derivative
+                self.prev_error = err
+                
+                vel = P_out + I_out + D_out
+                vel = np.clip(vel, -self.max_tracking_vel, self.max_tracking_vel)
+                
+                # 积分计算出目标位移
+                self.track_target_p += vel * dt
+                
+                msg.pose.position.x = self.track_target_p[0]
+                msg.pose.position.y = self.track_target_p[1]
+                msg.pose.position.z = self.track_target_p[2]
+                
+                # 保持启动时的姿态不变
+                msg.pose.orientation.x = self.track_target_r[0]
+                msg.pose.orientation.y = self.track_target_r[1]
+                msg.pose.orientation.z = self.track_target_r[2]
+                msg.pose.orientation.w = self.track_target_r[3]
+                
+                should_publish = True
+
+            # 如果有数据就发布
+            if should_publish:
+                self.pub.publish(msg)
+                
             rate.sleep()
+
+    # ====================================================
+    # [新增] 视觉伺服专用接口
+    # ====================================================
+    def start_tracking(self):
+        """开启跟踪模式"""
+        p, r = self.get_current_pose()
+        if p is not None:
+            self.track_target_p = p.copy()
+            self.track_target_r = r.copy() # 锁定启动时的姿态
+            self.integral.fill(0.0)
+            self.prev_error.fill(0.0)
+            self.current_error.fill(0.0)
+            self.is_tracking = True
+            print("👁️ [Robot] 视觉 PID 跟踪模式已启动 (队列空闲时接管)")
+
+    def stop_tracking(self):
+        """停止跟踪模式"""
+        self.is_tracking = False
+        print("🛑 [Robot] 视觉 PID 跟踪已停止")
+
+    def update_tracking_error(self, err_x, err_y, err_z=0.0):
+        """更新图像误差"""
+        if self.is_tracking:
+            self.current_error = np.array([err_x, err_y, err_z])
+    # ====================================================
