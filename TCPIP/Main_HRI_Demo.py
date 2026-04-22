@@ -95,6 +95,7 @@ except ImportError:
     VideoSender = None
 
 try:
+    import BodyPointCloud_dual
     from BodyPointCloud_dual import Body3DSkeletonProcess_dual
     print("✅ BodyPointCloud 导入完毕！")
 except ImportError:
@@ -354,6 +355,7 @@ def main():
 
     sSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sSock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     T_M = None 
 
@@ -397,6 +399,8 @@ def main():
     # 存放最新的全局坐标系下的眼动射线
     global_ray_origin = None 
     global_ray_hit = None
+    current_point_cloud = None
+    
     # ===============================
 
     try:
@@ -409,452 +413,477 @@ def main():
 
         conn.setblocking(False)
 
+        # ==========================================
+        # 🛠️ 新增：在这里初始化打印计时器（放在 while True 外面）
+        # ==========================================
+        last_e_print_time = 0.0
+        last_ray_print_time = 0.0
+        last_hit_print_time = 0.0
+        # ==========================================
+
+        last_yolo_time = 0.0
         while True:
-            header = None
+            while True:
+                header = None
 
-            try:
-                header_byte = conn.recv(1)
-                if header_byte:
-                    header = header_byte.decode('utf-8', errors='ignore')
-            except BlockingIOError:
-                pass # 没数据，跳过
-            except Exception as e:
-                print(f"连接异常: {e}")
-                break
-            
-            if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f', 'e']:
-                print(f"\n[TCP] Received Header: '{header}'")
-                conn.setblocking(True)
-            # ===============================================
-            # CASE 'd': 校准数据 (Calibration)
-            # ===============================================
-                if header == 'd':
-
-                    print("[TCP] Header 'd': Receiving calibration points...")
-                    count_bytes = recv_exact(conn, 4)
-                    if not count_bytes: break
-                    num_points = struct.unpack("<i", count_bytes)[0]
-                    
-                    total_bytes = num_points * 3 * 4
-                    data_bytes = recv_exact(conn, total_bytes)
-                    if not data_bytes: break
-
-                    if num_points == 5 and align_with_realsense:
-                        float_data = np.frombuffer(data_bytes, dtype='<f4')
-                        points3d = float_data.reshape((num_points, 3))
-                        
-                        print(f"   -> Received 5 points. Calculating T_M...")
-                        
-                        print(f"📍 Received {num_points} Calibration Points (HoloLens Ground Truth):")
-                        for i, pt in enumerate(points3d):
-                            print(f"   Index {i}: [{pt[0]:.6f}, {pt[1]:.6f}, {pt[2]:.6f}]")
-
-                        try:
-                            T_M = align_with_realsense(points3d, RECORD_FILE)
-                            print("\n" + "="*30)
-                            print(f"🎉 T_M Calculated!\n{T_M}")
-                            print("="*30 + "\n")
-                            send_T_M(conn, T_M)
-
-                            # [修改点] 计算成功后立即保存到本地
-                            save_tm_matrix(T_M, TM_CACHE_PATH)
-
-                        except Exception as e:
-                            print(f"❌ Calculation Error: {e}")
-                    else:
-                        print(f"⚠️ Expected 5 points, got {num_points}. Skipping.")
-
-
+                try:
+                    header_byte = conn.recv(1)
+                    if header_byte:
+                        header = header_byte.decode('utf-8', errors='ignore')
+                except BlockingIOError:
+                    break # 没数据，跳过
+                except Exception as e:
+                    print(f"连接异常: {e}")
+                    break
+                
+                if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f', 'e', 'O', 'P']:
+                    #print(f"\n[TCP] Received Header: '{header}'")
+                    conn.setblocking(True)
                 # ===============================================
-                # CASE 'r': 记录数据 (Record)
+                # CASE 'd': 校准数据 (Calibration)
                 # ===============================================
-                elif header == 'r':
-                    print("[TCP] Header 'r': Recording Point...")
-                    
-                    # 读取 4 字节整数 (Unity 发来的 Index)
-                    idx_bytes = recv_exact(conn, 4)
-                    if idx_bytes:
-                        point_index = struct.unpack('<i', idx_bytes)[0]
+                    if header == 'd':
+
+                        print("[TCP] Header 'd': Receiving calibration points...")
+                        count_bytes = recv_exact(conn, 4)
+                        if not count_bytes: break
+                        num_points = struct.unpack("<i", count_bytes)[0]
                         
-                        # 🌟 1. 获取机器人 EE 的绝对位姿 (位置 + 姿态)
-                        # 注意：你需要确保你的 get_position() 能同时返回 pos 和 quat
-                        # 假设返回格式为 (ee_pos, ee_quat)，如果你现有的函数只返回 pos，你需要修改它以获取 TF 的 rotation
-                        ee_pos, ee_quat = robot_listener.get_current_pose() 
-                        
-                        save_recorded_point(RECORD_FILE, point_index, ee_pos)
-                        
-                        # if ee_pos is not None and ee_quat is not None:
-                        #     # 🌟 2. 正向补偿：推算真实笔尖坐标
-                        #     #tool_pos, _ = ee_to_tool_tip(ee_pos, ee_quat)
+                        total_bytes = num_points * 3 * 4
+                        data_bytes = recv_exact(conn, total_bytes)
+                        if not data_bytes: break
+
+                        if num_points == 5 and align_with_realsense:
+                            float_data = np.frombuffer(data_bytes, dtype='<f4')
+                            points3d = float_data.reshape((num_points, 3))
                             
-                        #     # 3. 保存到文件 (保存笔尖坐标)
-                        #     save_recorded_point(RECORD_FILE, point_index, tool_pos)
-                        #     print(f"   ✅ 已记录笔尖坐标 {tool_pos} 到索引 {point_index}")
-                        # else:
-                        #     print("   ❌ Failed to read robot position for recording.")
-                    else:
-                        print("   ⚠️ Received 'r' header but failed to read index.")
+                            print(f"   -> Received 5 points. Calculating T_M...")
+                            
+                            print(f"📍 Received {num_points} Calibration Points (HoloLens Ground Truth):")
+                            for i, pt in enumerate(points3d):
+                                print(f"   Index {i}: [{pt[0]:.6f}, {pt[1]:.6f}, {pt[2]:.6f}]")
 
-                # ===============================================
-                # CASE 'b': 请求小球位置 (Ball)
-                # ===============================================
-                elif header == 'b':
-                    if robot == None:
-                        print(">> 正在连接机器人...")
-                        robot = RobotController()
+                            try:
+                                T_M = align_with_realsense(points3d, RECORD_FILE)
+                                print("\n" + "="*30)
+                                print(f"🎉 T_M Calculated!\n{T_M}")
+                                print("="*30 + "\n")
+                                send_T_M(conn, T_M)
 
-                    _ = recv_exact(conn, 1) # 读掉 Unity 的补位字节
-                    print("[TCP] Header 'b': Requesting Robot Position...")
-                    
-                    if T_M is not None:
-                        robot_pos = robot_listener.get_position()
-                        if robot_pos is not None:
-                            send_robot_ball_position(conn, robot_pos, T_M)
+                                # [修改点] 计算成功后立即保存到本地
+                                save_tm_matrix(T_M, TM_CACHE_PATH)
+
+                            except Exception as e:
+                                print(f"❌ Calculation Error: {e}")
                         else:
-                            print("   ❌ Failed to read robotPosition.txt")
-                    else:
-                        print("   ⚠️ T_M is None. Please calibrate first.")
+                            print(f"⚠️ Expected 5 points, got {num_points}. Skipping.")
 
 
-                # ===============================================
-                # CASE 'm': 移动目标 (Move Target) 
-                # ===============================================
-                # elif header == 'm':
-                #     data = recv_exact(conn, 12) # 再读 12 个字节 (3个float)
-                #     if len(data) == 12:
-                #         # '<fff' 表示：小端序 (Little Endian), 3个 float
-                #         ux, uy, uz = struct.unpack('<fff', data)
-                #         print(f"Unity target received: X={ux}, Y={uy}, Z={uz}")
-
-                #         if T_M is not None:
-                #             # === 调用转换函数 ===
-                #             target_robot_pos = rut.unity2robot_transform((ux, uy, uz), T_M)
-                            
-                #             if target_robot_pos is not None:
-                #                 print(f"target in robot coordinate frame{target_robot_pos}")
-                                
-                #                 robot.move_to(target_robot_pos, speed=0.02)
-                                
-                #             else:
-                #                 print("   ❌ 转换失败")
-                #         else:
-                #             print("   ⚠️ T_M 尚未计算，无法转换坐标。请先进行校准 (Header 'd')。")
-
-                # ===============================================
-                # CASE 'p': 接收位姿点序列 (Position + Orientation)
-                # ===============================================
-                elif header == 'p':
-                    print("\n" + "="*50)
-                    print("[TCP] 检测到 Header 'p'，开始解析位姿序列...")
-                    
-                    # 1. 读取点数 (4字节 Int)
-                    count_bytes = recv_exact(conn, 4)
-                    if not count_bytes: 
-                        print("   ❌ 未收到点数数据")
-                        break
-                    
-                    num_points = struct.unpack('<i', count_bytes)[0]
-                    print(f"   -> 计划接收关键点数: {num_points}")
-
-                    # 2. 读取数据包 (每个点 28 字节: 3 float pos + 4 float rot)
-                    bytes_per_point = 28
-                    total_bytes = num_points * bytes_per_point
-                    data_bytes = recv_exact(conn, total_bytes)
-                    if not data_bytes: 
-                        print("   ❌ 未收到完整位姿数据")
-                        break
-
-                    # 3. 解析与转换数据
-                    if T_M is not None:
-                        # 使用 numpy 将 buffer 转换为 (N, 7) 的矩阵
-                        raw_payload = np.frombuffer(data_bytes, dtype='<f4').reshape((num_points, 7))
+                    # ===============================================
+                    # CASE 'r': 记录数据 (Record)
+                    # ===============================================
+                    elif header == 'r':
+                        print("[TCP] Header 'r': Recording Point...")
                         
-                        path_with_orientations = []
-                        
-                        for i in range(num_points):
-                            # 提取位置
-                            u_pos = raw_payload[i, 0:3]
-                            # 提取四元数姿态 [qx, qy, qz, qw]
-                            u_rot_quat = raw_payload[i, 3:7] 
-
-                            # --- A. 位置转换 (Unity 坐标 -> 机器人坐标) ---
-                            r_pos = rut.unity2robot_transform(u_pos, T_M) #tooltip
+                        # 读取 4 字节整数 (Unity 发来的 Index)
+                        idx_bytes = recv_exact(conn, 4)
+                        if idx_bytes:
+                            point_index = struct.unpack('<i', idx_bytes)[0]
                             
-                            # --- B. 姿态转换 (调用封装好的函数，内部处理镜像、TM及RPY计算) ---
-                            # 该函数应返回一个字典，包含转换后的四元数和用于显示的 RPY
-                            res = rut.transform_unity_rot_to_robot(u_rot_quat, T_M)
-
-                            if r_pos is not None:
-                                path_with_orientations.append({
-                                    'pos': r_pos,
-                                    'rot': res['robot_quat']  # 存入用于执行的机器人系四元数
-                                })
-
-                                # --- C. 日志打印：对比原始角度与变换后角度 ---
-                                print(f"   [{i}] ---------------------------------------")
-                                print(f"       位置: Unity {np.round(u_pos, 2)} -> 机器人 {np.round(r_pos, 3)}")
-                                print(f"       姿态: 原始RPY(Unity): {np.round(res['raw_rpy'], 1)}°")
-                                print(f"       姿态: 变换RPY(Robot): {np.round(res['robot_rpy'], 1)}°")
-                                # 如果需要调试 XYZ 单位向量，可以打印 res['rhs_axes']
-
-                        # 4. 生成带姿态插值的平滑路径
-                        if len(path_with_orientations) >= 2:
-                            print(f"\n   [Interpolation] 正在生成平滑路径...")
-                            final_smooth_path = pathInterpolation.generate_smooth_path_with_orientation(
-                                path_with_orientations, 
-                                resolution=3
-                            )
-                            final_smooth_path.append(path_with_orientations[-1])
+                            # 🌟 1. 获取机器人 EE 的绝对位姿 (位置 + 姿态)
+                            # 注意：你需要确保你的 get_position() 能同时返回 pos 和 quat
+                            # 假设返回格式为 (ee_pos, ee_quat)，如果你现有的函数只返回 pos，你需要修改它以获取 TF 的 rotation
+                            ee_pos, ee_quat = robot_listener.get_current_pose() 
                             
-                            # 5. 执行机器人运动
-                            if robot is None: 
-                                robot = RobotController()
+                            save_recorded_point(RECORD_FILE, point_index, ee_pos)
                             
-                            print(f"   🚀 开始执行，总插值点数: {len(final_smooth_path)}")
-                            # 发送给机械臂执行
-                            robot.execute_path(final_smooth_path, speed=0.02)
-
-                            # 2. 🌟 关键：增加等待逻辑
-                            # 假设目标点是路径的最后一个点
-                            target_pos = final_smooth_path[-1]['pos'] 
-
-                            print(" ⏳ 等待机械臂到达目标位置...")
-                            while True:
-                                # 获取机械臂当前的实时位置 (你可以从你的 robot_listener 获取)
-                                current_pos = robot_listener.get_position() 
+                            # if ee_pos is not None and ee_quat is not None:
+                            #     # 🌟 2. 正向补偿：推算真实笔尖坐标
+                            #     #tool_pos, _ = ee_to_tool_tip(ee_pos, ee_quat)
                                 
-                                if current_pos is not None:
-                                    # 计算当前位置与目标位置的欧氏距离
-                                    dist = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
+                            #     # 3. 保存到文件 (保存笔尖坐标)
+                            #     save_recorded_point(RECORD_FILE, point_index, tool_pos)
+                            #     print(f"   ✅ 已记录笔尖坐标 {tool_pos} 到索引 {point_index}")
+                            # else:
+                            #     print("   ❌ Failed to read robot position for recording.")
+                        else:
+                            print("   ⚠️ Received 'r' header but failed to read index.")
+
+                    # ===============================================
+                    # CASE 'b': 请求小球位置 (Ball)
+                    # ===============================================
+                    elif header == 'b':
+                        if robot == None:
+                            print(">> 正在连接机器人...")
+                            robot = RobotController()
+
+                        _ = recv_exact(conn, 1) # 读掉 Unity 的补位字节
+                        print("[TCP] Header 'b': Requesting Robot Position...")
+                        
+                        if T_M is not None:
+                            robot_pos = robot_listener.get_position()
+                            if robot_pos is not None:
+                                send_robot_ball_position(conn, robot_pos, T_M)
+                            else:
+                                print("   ❌ Failed to read robotPosition.txt")
+                        else:
+                            print("   ⚠️ T_M is None. Please calibrate first.")
+
+
+                    # ===============================================
+                    # CASE 'm': 移动目标 (Move Target) 
+                    # ===============================================
+                    # elif header == 'm':
+                    #     data = recv_exact(conn, 12) # 再读 12 个字节 (3个float)
+                    #     if len(data) == 12:
+                    #         # '<fff' 表示：小端序 (Little Endian), 3个 float
+                    #         ux, uy, uz = struct.unpack('<fff', data)
+                    #         print(f"Unity target received: X={ux}, Y={uy}, Z={uz}")
+
+                    #         if T_M is not None:
+                    #             # === 调用转换函数 ===
+                    #             target_robot_pos = rut.unity2robot_transform((ux, uy, uz), T_M)
+                                
+                    #             if target_robot_pos is not None:
+                    #                 print(f"target in robot coordinate frame{target_robot_pos}")
                                     
-                                    # 如果距离小于 1cm (0.01m)，认为已到达
-                                    if dist < 0.01: 
-                                        break
-                                        
-                                time.sleep(0.1) # 每 100ms 检查一次，避免占用过多 CPU
-
-                            try:
-                                conn.sendall(b'm')
-                                print("   ✅ [TCP] 机械臂运动完毕，已向 HoloLens 发送 'm' 解锁信号")
-                            except Exception as e:
-                                print(f"   ❌ 发送完成信号失败: {e}")
-                    else:
-                        print("   ⚠️ T_M 矩阵为空，请先进行校准发送 'c'！")
-                    print("="*50 + "\n")
-
-                # ===============================================
-                # CASE 'f': 接收力控点序列 (Position + Orientation + Force)
-                # ===============================================
-                elif header == 'f':
-                    print("\n" + "="*50)
-                    print("[TCP] 检测到 Header 'f'，开始解析【力控】位姿序列...")
-                    
-                    # 1. 读取点数 (4字节 Int)
-                    count_bytes = recv_exact(conn, 4)
-                    if not count_bytes: 
-                        print("   ❌ 未收到点数数据")
-                        break
-                    
-                    num_points = struct.unpack('<i', count_bytes)[0]
-                    print(f"   -> 计划接收力控关键点数: {num_points}")
-
-                    # 2. 读取数据包 (每个点 32 字节: 3 pos + 4 rot + 1 force)
-                    bytes_per_point = 32
-                    total_bytes = num_points * bytes_per_point
-                    data_bytes = recv_exact(conn, total_bytes)
-                    if not data_bytes: 
-                        print("   ❌ 未收到完整力控数据")
-                        break
-
-                    # 3. 解析与转换数据
-                    if T_M is not None:
-                        # 每一行: [x, y, z, qx, qy, qz, qw, force]
-                        raw_payload = np.frombuffer(data_bytes, dtype='<f4').reshape((num_points, 8))
-                        
-                        path_with_force = []
-                        
-                        for i in range(num_points):
-                            u_pos = raw_payload[i, 0:3]
-                            u_rot_quat = raw_payload[i, 3:7] 
-                            target_force = raw_payload[i, 7] # 🌟 提取目标力
-
-                            # 坐标与姿态转换
-                            r_pos = rut.unity2robot_transform(u_pos, T_M)
-                            res = rut.transform_unity_rot_to_robot(u_rot_quat, T_M)
-
-                            if r_pos is not None:
-                                path_with_force.append({
-                                    'pos': r_pos,
-                                    'rot': res['robot_quat'],
-                                    'force': float(target_force)  # 加入 force 字段
-                                })
-
-                                print(f"   [{i}] 位置:{np.round(r_pos, 3)} | 姿态RPY:{np.round(res['robot_rpy'], 1)}° | 目标力:{target_force:.1f}N")
-
-                        # 4. 生成带姿态和【力】的平滑路径
-                        if len(path_with_force) >= 2:
-                            print(f"\n   [Interpolation] 正在生成力控平滑路径...")
-                            
-                            # 注意：你的插值函数需要更新，以支持 force 字段（见下文）
-                            final_smooth_path = pathInterpolation.generate_smooth_path_with_orientation(
-                                path_with_force, 
-                                resolution=3
-                            )
-                            
-                            final_smooth_path.append(path_with_force[-1])
-                            # 5. 执行机器人运动
-                            if robot is None: 
-                                robot = RobotController()
-                            
-                            print(f"   🚀 开始执行力控轨迹，总插值点数: {len(final_smooth_path)}")
-                            # 统一使用 execute_path，不再需要传 mode 参数
-                            robot.execute_path(final_smooth_path, speed=0.02)
-
-                            # 2. 🌟 关键：增加等待逻辑
-                            # 假设目标点是路径的最后一个点
-                            target_pos = final_smooth_path[-1]['pos'] 
-
-                            print(" ⏳ 等待机械臂到达目标位置...")
-                            while True:
-                                # 获取机械臂当前的实时位置 (你可以从你的 robot_listener 获取)
-                                current_pos = robot_listener.get_position() 
-                                
-                                if current_pos is not None:
-                                    # 计算当前位置与目标位置的欧氏距离
-                                    dist = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
+                    #                 robot.move_to(target_robot_pos, speed=0.02)
                                     
-                                    # 如果距离小于 1cm (0.01m)，认为已到达
-                                    if dist < 0.01: 
-                                        break
+                    #             else:
+                    #                 print("   ❌ 转换失败")
+                    #         else:
+                    #             print("   ⚠️ T_M 尚未计算，无法转换坐标。请先进行校准 (Header 'd')。")
+
+                    # ===============================================
+                    # CASE 'p': 接收位姿点序列 (Position + Orientation)
+                    # ===============================================
+                    elif header == 'p':
+                        print("\n" + "="*50)
+                        print("[TCP] 检测到 Header 'p'，开始解析位姿序列...")
+                        
+                        # 1. 读取点数 (4字节 Int)
+                        count_bytes = recv_exact(conn, 4)
+                        if not count_bytes: 
+                            print("   ❌ 未收到点数数据")
+                            break
+                        
+                        num_points = struct.unpack('<i', count_bytes)[0]
+                        print(f"   -> 计划接收关键点数: {num_points}")
+
+                        # 2. 读取数据包 (每个点 28 字节: 3 float pos + 4 float rot)
+                        bytes_per_point = 28
+                        total_bytes = num_points * bytes_per_point
+                        data_bytes = recv_exact(conn, total_bytes)
+                        if not data_bytes: 
+                            print("   ❌ 未收到完整位姿数据")
+                            break
+
+                        # 3. 解析与转换数据
+                        if T_M is not None:
+                            # 使用 numpy 将 buffer 转换为 (N, 7) 的矩阵
+                            raw_payload = np.frombuffer(data_bytes, dtype='<f4').reshape((num_points, 7))
+                            
+                            path_with_orientations = []
+                            
+                            for i in range(num_points):
+                                # 提取位置
+                                u_pos = raw_payload[i, 0:3]
+                                # 提取四元数姿态 [qx, qy, qz, qw]
+                                u_rot_quat = raw_payload[i, 3:7] 
+
+                                # --- A. 位置转换 (Unity 坐标 -> 机器人坐标) ---
+                                r_pos = rut.unity2robot_transform(u_pos, T_M) #tooltip
+                                
+                                # --- B. 姿态转换 (调用封装好的函数，内部处理镜像、TM及RPY计算) ---
+                                # 该函数应返回一个字典，包含转换后的四元数和用于显示的 RPY
+                                res = rut.transform_unity_rot_to_robot(u_rot_quat, T_M)
+
+                                if r_pos is not None:
+                                    path_with_orientations.append({
+                                        'pos': r_pos,
+                                        'rot': res['robot_quat']  # 存入用于执行的机器人系四元数
+                                    })
+
+                                    # --- C. 日志打印：对比原始角度与变换后角度 ---
+                                    print(f"   [{i}] ---------------------------------------")
+                                    print(f"       位置: Unity {np.round(u_pos, 2)} -> 机器人 {np.round(r_pos, 3)}")
+                                    print(f"       姿态: 原始RPY(Unity): {np.round(res['raw_rpy'], 1)}°")
+                                    print(f"       姿态: 变换RPY(Robot): {np.round(res['robot_rpy'], 1)}°")
+                                    # 如果需要调试 XYZ 单位向量，可以打印 res['rhs_axes']
+
+                            # 4. 生成带姿态插值的平滑路径
+                            if len(path_with_orientations) >= 2:
+                                print(f"\n   [Interpolation] 正在生成平滑路径...")
+                                final_smooth_path = pathInterpolation.generate_smooth_path_with_orientation(
+                                    path_with_orientations, 
+                                    resolution=3
+                                )
+                                final_smooth_path.append(path_with_orientations[-1])
+                                
+                                # 5. 执行机器人运动
+                                if robot is None: 
+                                    robot = RobotController()
+                                
+                                print(f"   🚀 开始执行，总插值点数: {len(final_smooth_path)}")
+                                # 发送给机械臂执行
+                                robot.execute_path(final_smooth_path, speed=0.02)
+
+                                # 2. 🌟 关键：增加等待逻辑
+                                # 假设目标点是路径的最后一个点
+                                target_pos = final_smooth_path[-1]['pos'] 
+
+                                print(" ⏳ 等待机械臂到达目标位置...")
+                                while True:
+                                    # 获取机械臂当前的实时位置 (你可以从你的 robot_listener 获取)
+                                    current_pos = robot_listener.get_position() 
+                                    
+                                    if current_pos is not None:
+                                        # 计算当前位置与目标位置的欧氏距离
+                                        dist = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
                                         
-                                time.sleep(0.1) # 每 100ms 检查一次，避免占用过多 CPU
+                                        # 如果距离小于 1cm (0.01m)，认为已到达
+                                        if dist < 0.01: 
+                                            break
+                                            
+                                    time.sleep(0.1) # 每 100ms 检查一次，避免占用过多 CPU
 
-                            try:
-                                conn.sendall(b'm')
-                                print("   ✅ [TCP] 机械臂力控运动完毕，已向 HoloLens 发送 'm' 解锁信号")
-                            except Exception as e:
-                                print(f"   ❌ 发送完成信号失败: {e}")
-                    else:
-                        print("   ⚠️ T_M 矩阵为空，请先进行校准发送 'c'！")
-                    print("="*50 + "\n")
+                                try:
+                                    conn.sendall(b'm')
+                                    print("   ✅ [TCP] 机械臂运动完毕，已向 HoloLens 发送 'm' 解锁信号")
+                                except Exception as e:
+                                    print(f"   ❌ 发送完成信号失败: {e}")
+                        else:
+                            print("   ⚠️ T_M 矩阵为空，请先进行校准发送 'c'！")
+                        print("="*50 + "\n")
 
-                # ===============================================
-                # CASE 'v': 接收视频流与食指坐标 (Video + Finger)
-                # ===============================================
-                elif header == 'v':
-                    print("\n" + "="*50)
-                    print("[TCP] Header 'v': Receiving Video Stream + Finger Data...")
-                    # 1. 读取传感器类型 (1 byte, 例如 'i' 表示红外)
-                    sensor_type_bytes = recv_exact(conn, 1)
-                    if not sensor_type_bytes: break
-                    sensor_type = sensor_type_bytes.decode('utf-8', errors='ignore')
-
-                    # 2. 读取食指坐标 (12 bytes -> 3 个 float)
-                    pos_bytes = recv_exact(conn, 12)
-                    if not pos_bytes: break
-                    finger_x, finger_y, finger_z = struct.unpack('<fff', pos_bytes)
-
-                    # 3. 读取图像数据长度 (4 bytes -> int)
-                    len_bytes = recv_exact(conn, 4)
-                    if not len_bytes: break
-                    img_len = struct.unpack('>i', len_bytes)[0]
-
-                    # 4. 读取全部图像数据
-                    img_data = recv_exact(conn, img_len)
-                    if not img_data: break
-
-                    # 5. 解析图像并显示
-                    img_array = np.frombuffer(img_data, dtype=np.uint8).copy() 
-                    
-                    frame = None
-                    # 判断：如果我们发的是 Raw Bytes，长度会严格等于像素数
-                    if img_len == 512 * 512:        # 短距相机分辨率 (Short-throw)
-                        frame = img_array.reshape((512, 512))
-                    elif img_len == 320 * 288:      # 长距相机分辨率 (Long-throw)
-                        frame = img_array.reshape((288, 320))
-                    else:
-                        # 如果后续你改成了发 JPG 压缩流，就用 imdecode 解压
-                        frame = cv2.imdecode(img_array, cv2.IMREAD_ANYCOLOR)
-
-                    if frame is not None:
-                        # 将接收到的食指坐标打印在画面上（便于直观调试）
-                        text = f"Finger: X={finger_x:.2f} Y={finger_y:.2f} Z={finger_z:.2f}"
-                        # 避免文字太暗看不清，针对灰度图用白色(255)显示
-                        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 255, 2)
+                    # ===============================================
+                    # CASE 'f': 接收力控点序列 (Position + Orientation + Force)
+                    # ===============================================
+                    elif header == 'f':
+                        print("\n" + "="*50)
+                        print("[TCP] 检测到 Header 'f'，开始解析【力控】位姿序列...")
                         
-                        cv2.imshow(f"HoloLens Stream ({sensor_type})", frame)
-                        cv2.waitKey(1) # 必须有这一句，OpenCV 才能刷新窗口
-                    else:
-                        print(f"   ⚠️ 图像解码失败，接收长度: {img_len}")
+                        # 1. 读取点数 (4字节 Int)
+                        count_bytes = recv_exact(conn, 4)
+                        if not count_bytes: 
+                            print("   ❌ 未收到点数数据")
+                            break
+                        
+                        num_points = struct.unpack('<i', count_bytes)[0]
+                        print(f"   -> 计划接收力控关键点数: {num_points}")
 
-                # ===============================================
-                # CASE 'e': 接收眼动追踪坐标 (Eye Tracking)
-                # ===============================================
-                elif header == 'e':
-                    eye_data_bytes = recv_exact(conn, 24)
-                    if not eye_data_bytes: break
-                    
-                    eye_data = struct.unpack('<6f', eye_data_bytes)
-                    u_origin_pos = np.array(eye_data[0:3])
-                    u_hit_pos = np.array(eye_data[3:6])
-                    
-                    if T_M is not None:
-                        # 使用 T_M 将 HoloLens 坐标转换到相机/全局坐标系
-                        r_origin_pos = rut.unity2robot_transform(u_origin_pos, T_M)
-                        r_hit_pos = rut.unity2robot_transform(u_hit_pos, T_M)
+                        # 2. 读取数据包 (每个点 32 字节: 3 pos + 4 rot + 1 force)
+                        bytes_per_point = 32
+                        total_bytes = num_points * bytes_per_point
+                        data_bytes = recv_exact(conn, total_bytes)
+                        if not data_bytes: 
+                            print("   ❌ 未收到完整力控数据")
+                            break
+
+                        # 3. 解析与转换数据
+                        if T_M is not None:
+                            # 每一行: [x, y, z, qx, qy, qz, qw, force]
+                            raw_payload = np.frombuffer(data_bytes, dtype='<f4').reshape((num_points, 8))
+                            
+                            path_with_force = []
+                            
+                            for i in range(num_points):
+                                u_pos = raw_payload[i, 0:3]
+                                u_rot_quat = raw_payload[i, 3:7] 
+                                target_force = raw_payload[i, 7] # 🌟 提取目标力
+
+                                # 坐标与姿态转换
+                                r_pos = rut.unity2robot_transform(u_pos, T_M)
+                                res = rut.transform_unity_rot_to_robot(u_rot_quat, T_M)
+
+                                if r_pos is not None:
+                                    path_with_force.append({
+                                        'pos': r_pos,
+                                        'rot': res['robot_quat'],
+                                        'force': float(target_force)  # 加入 force 字段
+                                    })
+
+                                    print(f"   [{i}] 位置:{np.round(r_pos, 3)} | 姿态RPY:{np.round(res['robot_rpy'], 1)}° | 目标力:{target_force:.1f}N")
+
+                            # 4. 生成带姿态和【力】的平滑路径
+                            if len(path_with_force) >= 2:
+                                print(f"\n   [Interpolation] 正在生成力控平滑路径...")
+                                
+                                # 注意：你的插值函数需要更新，以支持 force 字段（见下文）
+                                final_smooth_path = pathInterpolation.generate_smooth_path_with_orientation(
+                                    path_with_force, 
+                                    resolution=3
+                                )
+                                
+                                final_smooth_path.append(path_with_force[-1])
+                                # 5. 执行机器人运动
+                                if robot is None: 
+                                    robot = RobotController()
+                                
+                                print(f"   🚀 开始执行力控轨迹，总插值点数: {len(final_smooth_path)}")
+                                # 统一使用 execute_path，不再需要传 mode 参数
+                                robot.execute_path(final_smooth_path, speed=0.02)
+
+                                # 2. 🌟 关键：增加等待逻辑
+                                # 假设目标点是路径的最后一个点
+                                target_pos = final_smooth_path[-1]['pos'] 
+
+                                print(" ⏳ 等待机械臂到达目标位置...")
+                                while True:
+                                    # 获取机械臂当前的实时位置 (你可以从你的 robot_listener 获取)
+                                    current_pos = robot_listener.get_position() 
+                                    
+                                    if current_pos is not None:
+                                        # 计算当前位置与目标位置的欧氏距离
+                                        dist = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
+                                        
+                                        # 如果距离小于 1cm (0.01m)，认为已到达
+                                        if dist < 0.01: 
+                                            break
+                                            
+                                    time.sleep(0.1) # 每 100ms 检查一次，避免占用过多 CPU
+
+                                try:
+                                    conn.sendall(b'm')
+                                    print("   ✅ [TCP] 机械臂力控运动完毕，已向 HoloLens 发送 'm' 解锁信号")
+                                except Exception as e:
+                                    print(f"   ❌ 发送完成信号失败: {e}")
+                        else:
+                            print("   ⚠️ T_M 矩阵为空，请先进行校准发送 'c'！")
+                        print("="*50 + "\n")
+
+                    # ===============================================
+                    # CASE 'v': 接收视频流与食指坐标 (Video + Finger)
+                    # ===============================================
+                    elif header == 'v':
+                        print("\n" + "="*50)
+                        print("[TCP] Header 'v': Receiving Video Stream + Finger Data...")
+                        # 1. 读取传感器类型 (1 byte, 例如 'i' 表示红外)
+                        sensor_type_bytes = recv_exact(conn, 1)
+                        if not sensor_type_bytes: break
+                        sensor_type = sensor_type_bytes.decode('utf-8', errors='ignore')
+
+                        # 2. 读取食指坐标 (12 bytes -> 3 个 float)
+                        pos_bytes = recv_exact(conn, 12)
+                        if not pos_bytes: break
+                        finger_x, finger_y, finger_z = struct.unpack('<fff', pos_bytes)
+
+                        # 3. 读取图像数据长度 (4 bytes -> int)
+                        len_bytes = recv_exact(conn, 4)
+                        if not len_bytes: break
+                        img_len = struct.unpack('>i', len_bytes)[0]
+
+                        # 4. 读取全部图像数据
+                        img_data = recv_exact(conn, img_len)
+                        if not img_data: break
+
+                        # 5. 解析图像并显示
+                        img_array = np.frombuffer(img_data, dtype=np.uint8).copy() 
                         
-                        global_ray_origin = r_origin_pos
-                        global_ray_hit = r_hit_pos
+                        frame = None
+                        # 判断：如果我们发的是 Raw Bytes，长度会严格等于像素数
+                        if img_len == 512 * 512:        # 短距相机分辨率 (Short-throw)
+                            frame = img_array.reshape((512, 512))
+                        elif img_len == 320 * 288:      # 长距相机分辨率 (Long-throw)
+                            frame = img_array.reshape((288, 320))
+                        else:
+                            # 如果后续你改成了发 JPG 压缩流，就用 imdecode 解压
+                            frame = cv2.imdecode(img_array, cv2.IMREAD_ANYCOLOR)
+
+                        if frame is not None:
+                            # 将接收到的食指坐标打印在画面上（便于直观调试）
+                            text = f"Finger: X={finger_x:.2f} Y={finger_y:.2f} Z={finger_z:.2f}"
+                            # 避免文字太暗看不清，针对灰度图用白色(255)显示
+                            cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 255, 2)
+                            
+                            cv2.imshow(f"HoloLens Stream ({sensor_type})", frame)
+                            cv2.waitKey(1) # 必须有这一句，OpenCV 才能刷新窗口
+                        else:
+                            print(f"   ⚠️ 图像解码失败，接收长度: {img_len}")
+
+                    # ===============================================
+                    # CASE 'e': 接收眼动追踪坐标 (Eye Tracking)
+                    # ===============================================
+                    elif header == 'e':
+                        #print("receiving gazing position")
+                        eye_data_bytes = recv_exact(conn, 24)
+                        if not eye_data_bytes: break
                         
-                        # print(f"👁️ [TCP] 眼动坐标已更新...")
-                    else:
-                        print("   ⚠️ T_M 矩阵为空，无法转换眼动坐标！")
+                        eye_data = struct.unpack('<6f', eye_data_bytes)
+                        u_origin_pos = np.array(eye_data[0:3])
+                        u_hit_pos = np.array(eye_data[3:6])
+                        
+                        if T_M is not None:
+                            # 使用 T_M 将 HoloLens 坐标转换到相机/全局坐标系
+                            r_origin_pos = rut.unity2robot_transform(u_origin_pos, T_M)
+                            r_hit_pos = rut.unity2robot_transform(u_hit_pos, T_M)
+                            
+                            global_ray_origin = r_origin_pos
+                            global_ray_hit = r_hit_pos
+                            
+                            # ==========================================
+                            # Debug: Print Origin and End Point (Every 1 second)
+                            # ==========================================
+                            current_time = time.time() # 获取当前时间
+                            
+                            # ==========================================
+                            # 🛠️ 纯英文打印起点和终点 (每 1 秒打印一次)
+                            # ==========================================
+                            if current_time - last_ray_print_time > 1.0:
+                                print(f"[TCP] Gaze Origin: {np.round(r_origin_pos, 3)} | Gaze End: {np.round(r_hit_pos, 3)}")
+                            last_ray_print_time = current_time
+                            # ==========================================
+                                
+                            #print(f"👁️ [TCP] 眼动坐标已更新...")
+                        else:
+                            print("   ⚠️ T_M 矩阵为空，无法转换眼动坐标！")
+                    elif header == 'O': 
+                        is_HRI_Demo = True
+                        print("Demo模式已开")
+                    elif header == 'P': 
+                        is_HRI_Demo = False
+                        print("Demo模式已关")
+                elif header == 'S': 
+                    sender.is_streaming = True
+                    print("▶️ 开始传输")
+                elif header == 'E': 
+                    sender.is_streaming = False
+                    print("⏹️ 停止传输")
+
+                elif header == 'K': 
+                    is_skeleton_streaming = True
+                    print("▶️ 开始传输【骨架数据】")
+                elif header == 'L': 
+                    is_skeleton_streaming = False
+                    print("⏹️ 停止传输【骨架数据】")
                 
-                conn.setblocking(False) 
-                print(f"[TCP] {header} 处理完毕，切回视频模式")
+                elif header == 'J': 
+                    is_robot_state_streaming = True
+                    print("▶️ 开始以 30Hz 传输【全关节实时位姿】(Python端已转换)")
+                elif header == 'H': 
+                    is_robot_state_streaming = False
+                    print("⏹️ 停止传输【全关节实时位姿】")
 
-            elif header == 'S': 
-                sender.is_streaming = True
-                print("▶️ 开始传输")
-            elif header == 'E': 
-                sender.is_streaming = False
-                print("⏹️ 停止传输")
-
-            elif header == 'K': 
-                is_skeleton_streaming = True
-                print("▶️ 开始传输【骨架数据】")
-            elif header == 'L': 
-                is_skeleton_streaming = False
-                print("⏹️ 停止传输【骨架数据】")
+                # ===============   ================================
+                # CASE 'x': 退出 (Exit)
+                # ===============================================
+                elif header == 'x':
+                    print("[TCP] Received Exit signal. Cleaning up...")
+                    
+                    TM_CACHE_PATH = config['alignment'].get('tm_cache_file', 'tm_matrix.txt')
+                    if os.path.exists(TM_CACHE_PATH):
+                        os.remove(TM_CACHE_PATH)
+                        print("🧹 Cache cleared.")
+                    break
             
-            elif header == 'J': 
-                is_robot_state_streaming = True
-                print("▶️ 开始以 30Hz 传输【全关节实时位姿】(Python端已转换)")
-            elif header == 'H': 
-                is_robot_state_streaming = False
-                print("⏹️ 停止传输【全关节实时位姿】")
+                else:
+                    pass
+                conn.setblocking(False) 
+                #print(f"[TCP] {header} 处理完毕，切回视频模式")
 
-            elif header == 'O': 
-                is_HRI_Demo = True
-                print("Demo模式已开")
-            elif header == 'P': 
-                is_HRI_Demo = False
-                print("Demo模式已关")
+           
 
-            # ===============   ================================
-            # CASE 'x': 退出 (Exit)
-            # ===============================================
-            elif header == 'x':
-                print("[TCP] Received Exit signal. Cleaning up...")
-                
-                TM_CACHE_PATH = config['alignment'].get('tm_cache_file', 'tm_matrix.txt')
-                if os.path.exists(TM_CACHE_PATH):
-                    os.remove(TM_CACHE_PATH)
-                    print("🧹 Cache cleared.")
-                break
-        
-            else:
-                pass
+
 
             # --- 只有在开关打开时才执行发送函数 ---
             # --- 重点：视频转发逻辑 ---
@@ -863,51 +892,54 @@ def main():
                 sender.send_frame(conn, sensor_type='c')
 
             if is_skeleton_streaming and Body3DSkeletonProcess_dual:
-                F_z = np.eye(4)
-                F_z[2, 2] = -1.0
+                if time.time() - last_yolo_time > 0.1:
+                    last_yolo_time = time.time() # 记录运行时间
+                        
+                    F_z = np.eye(4)
+                    F_z[2, 2] = -1.0
+                    
+                        
+                    if robot_listener is not None:
+                        # geting skeleton_coord_robot
+                        ee_pos, ee_quat = robot_listener.get_current_pose()
+
+                        # 注意：如果你的机械臂不是绕 X 轴旋转导致画面倾斜，请把 [0] 改成 [2] (Z轴) 或 [1] (Y轴)
+                        from scipy.spatial.transform import Rotation as R
+                        euler_angles = R.from_quat(ee_quat).as_euler('xyz', degrees=True)
+                        current_ry = euler_angles[1]  # [1] 代表取出 Ry
+                        
+                        # 💡 设定基准角度：即相机画面正立时的 Ry 角度
+                        BASELINE_RY = -47.6 
+                        
+                        # 💡 计算图像到底歪了多少度
+                        roll_angle = current_ry - BASELINE_RY
+
+                        skeleton_coord_camera, should_quit = Body3DSkeletonProcess_dual(
+                            F_z,
+                            use_dual_camera=False,
+                            roll_angle = roll_angle
+                            ) #remain right-handed
+                        #print("gained skeleton data from camera")
+
+                        skeleton_coord_robot = camera2unity.points_camera_to_robot(skeleton_coord_camera, ee_pos, ee_quat, EE_T_C)
+                        #print("transformed to robot coord")
+                        rviz_broadcaster.publish(skeleton_coord_robot)
+
+                        if T_M is not None:
+                            skeleton_coord_unity = camera2unity.points_camera_to_unity(skeleton_coord_camera, ee_pos, ee_quat, EE_T_C, T_M)
+                            #print("transformed to unity")
+
+                            if not should_quit and skeleton_coord_unity:
+                                # 6. 截取前 17 个身体关键点 (丢掉后面的手部点)
+                                body_only_coords = skeleton_coord_unity[:17]
+                                
+                                send_skeleton_data(conn, body_only_coords)
+                                
+                        else:
+                            # 防止疯狂打印，可以加个简单的限流，或者只提醒一次
+                            # print("⚠️ 骨架开关已开，但尚未进行相机校准 (T_M is None)！")
+                            pass
                 
-                    
-                if robot_listener is not None:
-                    # geting skeleton_coord_robot
-                    ee_pos, ee_quat = robot_listener.get_current_pose()
-
-                    # 注意：如果你的机械臂不是绕 X 轴旋转导致画面倾斜，请把 [0] 改成 [2] (Z轴) 或 [1] (Y轴)
-                    from scipy.spatial.transform import Rotation as R
-                    euler_angles = R.from_quat(ee_quat).as_euler('xyz', degrees=True)
-                    current_ry = euler_angles[1]  # [1] 代表取出 Ry
-                    
-                    # 💡 设定基准角度：即相机画面正立时的 Ry 角度
-                    BASELINE_RY = -47.6 
-                    
-                    # 💡 计算图像到底歪了多少度
-                    roll_angle = current_ry - BASELINE_RY
-
-                    skeleton_coord_camera, should_quit = Body3DSkeletonProcess_dual(
-                        F_z,
-                        use_dual_camera=False,
-                        roll_angle = roll_angle
-                        ) #remain right-handed
-                    #print("gained skeleton data from camera")
-
-                    skeleton_coord_robot = camera2unity.points_camera_to_robot(skeleton_coord_camera, ee_pos, ee_quat, EE_T_C)
-                    #print("transformed to robot coord")
-                    rviz_broadcaster.publish(skeleton_coord_robot)
-
-                    if T_M is not None:
-                        skeleton_coord_unity = camera2unity.points_camera_to_unity(skeleton_coord_camera, ee_pos, ee_quat, EE_T_C, T_M)
-                        #print("transformed to unity")
-
-                        if not should_quit and skeleton_coord_unity:
-                            # 6. 截取前 17 个身体关键点 (丢掉后面的手部点)
-                            body_only_coords = skeleton_coord_unity[:17]
-                            
-                            send_skeleton_data(conn, body_only_coords)
-                            
-                    else:
-                        # 防止疯狂打印，可以加个简单的限流，或者只提醒一次
-                        # print("⚠️ 骨架开关已开，但尚未进行相机校准 (T_M is None)！")
-                        pass
-            
             # --- 机械臂全关节实时状态流 (30Hz) ---
             if is_robot_state_streaming and robot_listener is not None:
                 current_time = time.time()
@@ -958,11 +990,19 @@ def main():
             if is_HRI_Demo:
                 # -1. 待机状态：等待 'O' 信号启动
                 if current_hri_state == STATE_IDLE:
-                    if robot is None:
-                        robot = RobotController()
+                    # if robot is None:
+                    #     robot = RobotController()
+                    # print("\n" + "="*50)
+                    # print("🤖 [HRI] 收到指令，启动人机交互流程！")
+                    # current_hri_state = STATE_INIT # 切入状态 0
+                    # print("="*50 + "\n")
+
                     print("\n" + "="*50)
-                    print("🤖 [HRI] 收到指令，启动人机交互流程！")
-                    current_hri_state = STATE_INIT # 切入状态 0
+                    print("🤖 [HRI] 测试模式：跳过跟踪，直接进入状态 3 (物品凝视)！")
+                    
+                    current_hri_state = STATE_SCAN_OBJECTS  # 🌟 直接空降状态 3！
+                    hri_start_time = 0.0                    # 确保重置计时器
+                    
                     print("="*50 + "\n")
                 
                 # 0. 初始位姿状态：机械臂前往预设的初始位置，等待 5 秒让用户观察
@@ -1073,74 +1113,127 @@ def main():
                             current_hri_state = STATE_SCAN_OBJECTS
                             hri_start_time = 0.0
 
+                        
                 # -----------------------------------
-                # 状态 3：扫描桌面物体
+                # 状态 3：扫描桌面物体，凝视确认 (跨文件获取点云版)
                 # -----------------------------------
                 elif current_hri_state == STATE_SCAN_OBJECTS:
                     
                     if hri_start_time == 0.0:
                         print("🔍 [HRI] 状态 3: 机械臂已就位，请凝视你要抓取的物体 (持续 2 秒)...")
                         hri_start_time = time.time()
+                        debug_print_time = time.time() 
                         
-                        # 清空 TCP 后台的旧数据
-                        global global_eye_intersection
-                        global_eye_intersection = None 
-                        
-                        # --- 新增：注视确认专属变量 ---
-                        fixation_point = None       # 当前正在凝视的中心点
-                        fixation_start_time = 0.0   # 凝视开始的时间
-                        FIXATION_TOLERANCE = 0.05   # 空间容差：5厘米半径 (视防抖情况可调)
-                        FIXATION_TIME_REQUIRED = 2.0 # 时间阈值：需要连续盯住 2 秒
-                        # -----------------------------
+                        # 初始化凝视变量
+                        fixation_point = None       
+                        fixation_start_time = 0.0   
+                        FIXATION_TOLERANCE = 0.05   
+                        FIXATION_TIME_REQUIRED = 2.0 
                         
                     else:
-                        # 1. 检查后台 TCP 是否算出了当前帧的眼动交点
-                        if global_eye_intersection is not None:
-                            current_pt = global_eye_intersection.copy()
+                        current_pt = None
+                        
+                        # ==========================================
+                        # 1. 🌟 跨文件拿点云！(确保你文件顶部 import 了它)
+                        # ==========================================
+                        if current_point_cloud is None:
+                            print(f"getting latest")
+                            current_point_cloud = BodyPointCloud_dual.global_latest_verts
+
+                        verts_robot_base = None
+                        if current_point_cloud is not None:
+                            ee_pos, ee_quat = robot_listener.get_current_pose()
+                            if ee_pos is not None and ee_quat is not None:
+                                verts_robot_base = camera2unity.point_cloud_camera_to_robot(
+                                    current_point_cloud, ee_pos, ee_quat, EE_T_C
+                                )
+                        
+                        # 2. 只有当起点、终点、点云这三兄弟都到齐了，才算交点
+                        if global_ray_origin is not None and global_ray_hit is not None and current_point_cloud is not None:
+                            current_pt = get_gaze_point_cloud_intersection(
+                                ray_origin=global_ray_origin, 
+                                ray_hit_pos=global_ray_hit, 
+                                point_cloud=verts_robot_base, 
+                                radius=0.01 # 容差半径，打不中物体可以适当调大到 0.08
+                            )
                             
-                            # 2. 如果还没有建立凝视点，或者刚刚丢失，则初始化
+                        # ==========================================
+                        # 🛠️ 调试信息打印 (每 0.5 秒打印一次防刷屏)
+                        # ==========================================
+                        if time.time() - debug_print_time > 0.5:
+                            print("\n" + "-" * 40)
+                            if verts_robot_base is None:
+                                print(f"No point cloud")
+                            if global_ray_origin is not None and global_ray_hit is not None:
+                                print(f"👀 [Debug] 射线起点: {np.round(global_ray_origin, 3)} | 终点: {np.round(global_ray_hit, 3)}")
+                            
+                            if current_pt is not None:
+                                print(f"🎯 [Debug] 击中点云！物理交点 : {np.round(current_pt, 3)}")
+                            elif current_point_cloud is None:
+                                print(f"⚠️ [Debug] 正在等待相机线程吐出有效点云...")
+                            else:
+                                print(f"❌ [Debug] 射线未击中点云 (视线可能移开了，或目标表面太反光)")
+                            print("-" * 40)
+                            debug_print_time = time.time()
+                        # ==========================================
+
+                        # 3. 凝视确认逻辑 (仅在击中物体时运行)
+                        if current_pt is not None:
                             if fixation_point is None:
                                 fixation_point = current_pt
                                 fixation_start_time = time.time()
                                 print(" ⏱️ [HRI] 检测到视线落点，开始凝视计时...")
                                 
                             else:
-                                # 3. 计算当前视线与凝视中心的距离
+                                # 计算视线偏移距离
                                 dist = np.linalg.norm(current_pt - fixation_point)
                                 
-                                # 4. 判断是否在容差范围内 (还在盯同一个东西)
+                                # 判断是否在容差范围内 (没乱看)
                                 if dist < FIXATION_TOLERANCE:
                                     dwell_time = time.time() - fixation_start_time
                                     
-                                    # 打印一个进度条提示（可选，方便调试）
-                                    # print(f"   [注视进度]: {dwell_time:.1f}s / {FIXATION_TIME_REQUIRED}s")
-                                    
-                                    # 5. 满足时间阈值！触发确认！
+                                    # 满足 2 秒！触发确认！
                                     if dwell_time >= FIXATION_TIME_REQUIRED:
                                         print(f"\n 🎉 [HRI] 凝视确认成功！锁定目标坐标: {np.round(fixation_point, 3)}")
                                         print(" 🚀 [HRI] 准备执行抓取动作...\n")
 
-                                        fixation_point_unity = rut.robot2unity_transform(fixation_point, T_M)
+                                        # 将机器人坐标系的交点，倒推回 Unity 坐标系并发送
+                                        if T_M is not None:
+                                            try:
+                                                u_target = rut.robot2unity_transform(fixation_point, T_M)
+                                                
+                                                packet = b't' + struct.pack('<fff', u_target[0], u_target[1], u_target[2])
+                                                conn.sendall(packet)
+                                                print(f" 📡 [TCP] 已将目标坐标 {np.round(u_target, 3)} 发给 Unity 生成全息标记！")
+                                            except Exception as e:
+                                                print(f" ❌ [TCP] 发送 Unity 坐标失败: {e}")
                                         
-                                        if robot is not None:
-                                            # 移动到目标上方准备抓取
-                                            hover_pose = [fixation_point[0], fixation_point[1], fixation_point[2] + 0.1]
-                                            robot.move_to(hover_pose, speed=0.03)
+                                        # 可选：让机械臂先移到物体正上方准备
+                                        # if robot is not None:
+                                        #     hover_pose = [fixation_point[0], fixation_point[1], fixation_point[2] + 0.1]
+                                        #     robot.move_to(hover_pose, speed=0.03)
                                         
-                                        # 状态流转：进入下一个状态
-                                        current_hri_state = STATE_GRAB_OBJECT # 假设 4 是执行抓取状态
+                                        # 状态流转：前往下一个动作
+                                        current_hri_state = STATE_GRAB_OBJECT 
                                         hri_start_time = 0.0
                                         
-                                # 如果偏移过大，说明用户看向了别的地方 -> 重置凝视！
+                                # 眼睛看向了别的地方，重置凝视点和计时器
                                 else:
-                                    # print(" 🔄 [HRI] 视线转移，重新开始计时...")
                                     fixation_point = current_pt
                                     fixation_start_time = time.time()
                                     
-                        # 如果视线完全丢失 (看向了没有点云的虚空)
+                        # 如果视线落在了没有点云的虚空，直接打断计时
                         else:
                             fixation_point = None
                             fixation_start_time = 0.0
+
+                        # # 4. 全局超时逻辑：15 秒没选出来，自动放弃
+                        # if time.time() - hri_start_time > 15.0:
+                        #     print(" ⏲️ [HRI] 15秒内未完成凝视确认，放弃本次抓取。")
+                        #     if robot is not None:
+                        #         robot.move_to(INIT_POSE, speed=0.05)
+                        #     current_hri_state = STATE_IDLE
+                        #     hri_start_time = 0.0
 
                 
     except Exception as e:
