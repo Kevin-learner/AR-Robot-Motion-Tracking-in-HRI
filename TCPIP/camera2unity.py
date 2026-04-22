@@ -62,6 +62,11 @@ def points_camera_to_robot(points_camera, ee_pos, ee_quat, EE_T_C):
     points_robot = transform_points(points_camera, ROBOT_T_C)
     return points_robot.tolist()
 
+def point_cloud_camera_to_robot(points_camera, ee_pos, ee_quat, EE_T_C):
+    ROBOT_T_C = get_camera_to_robot_matrix(ee_pos, ee_quat, EE_T_C)
+    points_robot = transform_points(points_camera, ROBOT_T_C)
+    return points_robot
+
 def points_camera_to_unity(points_camera, ee_pos, ee_quat, EE_T_C, UNITY_T_ROBOT):
     ROBOT_T_C = get_camera_to_robot_matrix(ee_pos, ee_quat, EE_T_C)
 

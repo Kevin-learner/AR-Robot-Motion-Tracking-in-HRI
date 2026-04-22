@@ -476,6 +476,10 @@ def process_skeleton_single(pipeline, pc, color_intrinsics_out, R=None, T=None, 
     verts = verts.reshape(h * w, 3)
     texcoords = texcoords.reshape(h * w, 2)
 
+    global global_latest_verts
+    valid_mask = verts[:, 2] > 0
+    global_latest_verts = verts[valid_mask]
+    
     start_time = time.time()  # 开始计时
     #pose_2d_yolo = YOLOposeDetect(color_image)
     pose_2d_yolo = YOLOposeDetect_with_rotation(color_image, roll_angle=roll_angle)

@@ -124,6 +124,13 @@ try:
 except ImportError:
     print("⚠️ Warning: RvisSkeletonBroacaster.py not found. ")
     camera2unity = None
+
+try:
+    from gaze_interaction import get_gaze_point_cloud_intersection
+except ImportError:
+    print("⚠️ Warning: gaze_interaction.py not found. No way to compute gaze interaction.")
+    get_gaze_point_cloud_intersection = None
+
 # -------------------------------------------------
 # 2. 核心与辅助函数
 # -------------------------------------------------
@@ -373,6 +380,7 @@ def main():
     STATE_TRACKING = 1       # 1. 跟踪人体，维持在视野中央
     STATE_CHECK_INTENT = 2   # 2. 识别意图 
     STATE_SCAN_OBJECTS = 3   # 3. 扫描桌面物品
+    STATE_GRAB_OBJECT = 4       # 4. 抓取物品
     
     current_hri_state = STATE_IDLE
     hri_start_time = 0.0     # 记录状态切换的时间，用于非阻塞等待
@@ -385,6 +393,10 @@ def main():
 
     intent_history = deque(maxlen=30)
     LOOK_AT_TABLE_POSE = [0.2766, 0.5236, 0.4433, -0.95, -0.32, -0.01, 0.05]
+
+    # 存放最新的全局坐标系下的眼动射线
+    global_ray_origin = None 
+    global_ray_hit = None
     # ===============================
 
     try:
@@ -410,7 +422,7 @@ def main():
                 print(f"连接异常: {e}")
                 break
             
-            if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f']:
+            if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f', 'e']:
                 print(f"\n[TCP] Received Header: '{header}'")
                 conn.setblocking(True)
             # ===============================================
@@ -774,6 +786,29 @@ def main():
                         cv2.waitKey(1) # 必须有这一句，OpenCV 才能刷新窗口
                     else:
                         print(f"   ⚠️ 图像解码失败，接收长度: {img_len}")
+
+                # ===============================================
+                # CASE 'e': 接收眼动追踪坐标 (Eye Tracking)
+                # ===============================================
+                elif header == 'e':
+                    eye_data_bytes = recv_exact(conn, 24)
+                    if not eye_data_bytes: break
+                    
+                    eye_data = struct.unpack('<6f', eye_data_bytes)
+                    u_origin_pos = np.array(eye_data[0:3])
+                    u_hit_pos = np.array(eye_data[3:6])
+                    
+                    if T_M is not None:
+                        # 使用 T_M 将 HoloLens 坐标转换到相机/全局坐标系
+                        r_origin_pos = rut.unity2robot_transform(u_origin_pos, T_M)
+                        r_hit_pos = rut.unity2robot_transform(u_hit_pos, T_M)
+                        
+                        global_ray_origin = r_origin_pos
+                        global_ray_hit = r_hit_pos
+                        
+                        # print(f"👁️ [TCP] 眼动坐标已更新...")
+                    else:
+                        print("   ⚠️ T_M 矩阵为空，无法转换眼动坐标！")
                 
                 conn.setblocking(False) 
                 print(f"[TCP] {header} 处理完毕，切回视频模式")
@@ -1037,6 +1072,76 @@ def main():
                             print(" ✅ [HRI] 视线已锁定桌面！准备进入物品识别 (State 3)...")
                             current_hri_state = STATE_SCAN_OBJECTS
                             hri_start_time = 0.0
+
+                # -----------------------------------
+                # 状态 3：扫描桌面物体
+                # -----------------------------------
+                elif current_hri_state == STATE_SCAN_OBJECTS:
+                    
+                    if hri_start_time == 0.0:
+                        print("🔍 [HRI] 状态 3: 机械臂已就位，请凝视你要抓取的物体 (持续 2 秒)...")
+                        hri_start_time = time.time()
+                        
+                        # 清空 TCP 后台的旧数据
+                        global global_eye_intersection
+                        global_eye_intersection = None 
+                        
+                        # --- 新增：注视确认专属变量 ---
+                        fixation_point = None       # 当前正在凝视的中心点
+                        fixation_start_time = 0.0   # 凝视开始的时间
+                        FIXATION_TOLERANCE = 0.05   # 空间容差：5厘米半径 (视防抖情况可调)
+                        FIXATION_TIME_REQUIRED = 2.0 # 时间阈值：需要连续盯住 2 秒
+                        # -----------------------------
+                        
+                    else:
+                        # 1. 检查后台 TCP 是否算出了当前帧的眼动交点
+                        if global_eye_intersection is not None:
+                            current_pt = global_eye_intersection.copy()
+                            
+                            # 2. 如果还没有建立凝视点，或者刚刚丢失，则初始化
+                            if fixation_point is None:
+                                fixation_point = current_pt
+                                fixation_start_time = time.time()
+                                print(" ⏱️ [HRI] 检测到视线落点，开始凝视计时...")
+                                
+                            else:
+                                # 3. 计算当前视线与凝视中心的距离
+                                dist = np.linalg.norm(current_pt - fixation_point)
+                                
+                                # 4. 判断是否在容差范围内 (还在盯同一个东西)
+                                if dist < FIXATION_TOLERANCE:
+                                    dwell_time = time.time() - fixation_start_time
+                                    
+                                    # 打印一个进度条提示（可选，方便调试）
+                                    # print(f"   [注视进度]: {dwell_time:.1f}s / {FIXATION_TIME_REQUIRED}s")
+                                    
+                                    # 5. 满足时间阈值！触发确认！
+                                    if dwell_time >= FIXATION_TIME_REQUIRED:
+                                        print(f"\n 🎉 [HRI] 凝视确认成功！锁定目标坐标: {np.round(fixation_point, 3)}")
+                                        print(" 🚀 [HRI] 准备执行抓取动作...\n")
+
+                                        fixation_point_unity = rut.robot2unity_transform(fixation_point, T_M)
+                                        
+                                        if robot is not None:
+                                            # 移动到目标上方准备抓取
+                                            hover_pose = [fixation_point[0], fixation_point[1], fixation_point[2] + 0.1]
+                                            robot.move_to(hover_pose, speed=0.03)
+                                        
+                                        # 状态流转：进入下一个状态
+                                        current_hri_state = STATE_GRAB_OBJECT # 假设 4 是执行抓取状态
+                                        hri_start_time = 0.0
+                                        
+                                # 如果偏移过大，说明用户看向了别的地方 -> 重置凝视！
+                                else:
+                                    # print(" 🔄 [HRI] 视线转移，重新开始计时...")
+                                    fixation_point = current_pt
+                                    fixation_start_time = time.time()
+                                    
+                        # 如果视线完全丢失 (看向了没有点云的虚空)
+                        else:
+                            fixation_point = None
+                            fixation_start_time = 0.0
+
                 
     except Exception as e:
         print(f"[TCP] Server Error: {e}")
