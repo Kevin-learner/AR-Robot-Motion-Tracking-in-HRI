@@ -480,6 +480,18 @@ def process_skeleton_single(pipeline, pc, color_intrinsics_out, R=None, T=None, 
     valid_mask = verts[:, 2] > 0
     global_latest_verts = verts[valid_mask]
     
+    # === 🌟 紧接着在下面加上这几行：导出真实颜色！ ===
+    global global_latest_colors
+    
+    # 1. 把 RealSense 的 BGR 图像转为标准的 RGB 图像
+    color_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+    
+    # 2. 将图片展平并归一化到 0~1 之间 (Open3D 要求的颜色格式)
+    flat_colors = color_rgb.reshape(-1, 3) / 255.0
+    
+    # 3. 使用同样的 valid_mask，保证颜色和 3D 点一一对应
+    global_latest_colors = flat_colors[valid_mask]
+    
     start_time = time.time()  # 开始计时
     #pose_2d_yolo = YOLOposeDetect(color_image)
     pose_2d_yolo = YOLOposeDetect_with_rotation(color_image, roll_angle=roll_angle)

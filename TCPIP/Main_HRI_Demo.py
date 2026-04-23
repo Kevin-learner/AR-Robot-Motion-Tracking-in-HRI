@@ -128,9 +128,11 @@ except ImportError:
 
 try:
     from gaze_interaction import get_gaze_point_cloud_intersection
+    from gaze_interaction import PointCloudAccumulator
 except ImportError:
     print("⚠️ Warning: gaze_interaction.py not found. No way to compute gaze interaction.")
     get_gaze_point_cloud_intersection = None
+    PointCloudAccumulator = None
 
 # -------------------------------------------------
 # 2. 核心与辅助函数
@@ -382,7 +384,8 @@ def main():
     STATE_TRACKING = 1       # 1. 跟踪人体，维持在视野中央
     STATE_CHECK_INTENT = 2   # 2. 识别意图 
     STATE_SCAN_OBJECTS = 3   # 3. 扫描桌面物品
-    STATE_GRAB_OBJECT = 4       # 4. 抓取物品
+    STATE_GAZE_INTERSECTION = 4 # 4. gaze selection
+    STATE_GRAB_OBJECT = 5       # 5. 抓取物品
     
     current_hri_state = STATE_IDLE
     hri_start_time = 0.0     # 记录状态切换的时间，用于非阻塞等待
@@ -400,6 +403,40 @@ def main():
     global_ray_origin = None 
     global_ray_hit = None
     current_point_cloud = None
+    
+    # ====== Multipointcloud test ======
+    # 这里使用的是 [x, y, z, qx, qy, qz, qw] 或关节角，只要符合你的 robot.move_to 格式即可
+
+    SCAN_START_POSE = [-0.1340, 0.5319, 0.3668, -0.91, -0.41, -0.00, 0.05]
+    SCAN_END_POSE   = [0.2765, 0.5066, 0.3488, -0.95, -0.32, -0.05, 0.00]
+    SCAN_STEPS = 8  # 直线上拍 4 张照片（起点、2个中间点、终点）
+
+
+    scan_waypoints = []
+
+    for i in range(SCAN_STEPS):
+        ratio = i / (SCAN_STEPS - 1)
+        # 简单的线性插值
+        interpolated_pose = [
+            SCAN_START_POSE[j] + ratio * (SCAN_END_POSE[j] - SCAN_START_POSE[j])
+            for j in range(len(SCAN_START_POSE))
+        ]
+        scan_waypoints.append(interpolated_pose)
+
+
+    scan_current_step = 0 # 记录走到第几个点了
+  
+    # 实例化建图累加器
+
+    scene_mapper = PointCloudAccumulator(voxel_size=0.01) 
+    # 🌟 2. 绑定按键回调：在 Open3D 窗口按 'C' 触发拍照标志位
+    capture_flag = [False] # 使用列表包装，方便在回调函数中修改
+    def key_callback_capture(vis):
+        capture_flag[0] = True
+        return False
+        
+    scene_mapper.vis.register_key_callback(ord('C'), key_callback_capture)
+    scene_mapper.vis.register_key_callback(ord('c'), key_callback_capture)
     
     # ===============================
 
@@ -990,8 +1027,8 @@ def main():
             if is_HRI_Demo:
                 # -1. 待机状态：等待 'O' 信号启动
                 if current_hri_state == STATE_IDLE:
-                    # if robot is None:
-                    #     robot = RobotController()
+                    if robot is None:
+                        robot = RobotController()
                     # print("\n" + "="*50)
                     # print("🤖 [HRI] 收到指令，启动人机交互流程！")
                     # current_hri_state = STATE_INIT # 切入状态 0
@@ -1114,126 +1151,145 @@ def main():
                             hri_start_time = 0.0
 
                         
-                # -----------------------------------
-                # 状态 3：扫描桌面物体，凝视确认 (跨文件获取点云版)
+      # 状态 3：全自动直线巡航建图 (闭环距离控制版)
                 # -----------------------------------
                 elif current_hri_state == STATE_SCAN_OBJECTS:
                     
                     if hri_start_time == 0.0:
-                        print("🔍 [HRI] 状态 3: 机械臂已就位，请凝视你要抓取的物体 (持续 2 秒)...")
+                        print(f"\n🚀 [HRI] 状态 3: 启动全自动扫描。计划扫描点数: {SCAN_STEPS}")
+                        scene_mapper.clear()  
+                        scan_current_step = 0 
+                        
+                        if robot is not None:
+                            robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
+                        
+                        hri_start_time = time.time()
+                        last_capture_time = 0.0 # 🌟 魔法变量：0.0 表示“正在移动”，>0 表示“已到达，正在防抖计时”
+                        
+                    else:
+                        # 保持 3D 窗口实时刷新
+                        scene_mapper.update_window()
+                        
+                        ee_pos, ee_quat = robot_listener.get_current_pose()
+                        
+                        if ee_pos is not None:
+                            # ==========================================
+                            # 🎯 核心逻辑：计算真实物理距离
+                            # ==========================================
+                            target_pos = scan_waypoints[scan_current_step][0:3]
+                            # 计算当前末端位置与目标位置的直线距离 (欧氏距离)
+                            dist = np.linalg.norm(np.array(ee_pos) - np.array(target_pos))
+                            
+                            # 【阶段 A】：如果还在路上
+                            if last_capture_time == 0.0:
+                                # 如果距离小于 0.02 米 (2 厘米)，说明抵达目标！
+                                if dist < 0.02:
+                                    print(f"📍 已到达节点 {scan_current_step + 1}！停顿 0.8 秒防抖...")
+                                    last_capture_time = time.time() # 触发防抖计时器
+                            
+                            # 【阶段 B】：已经到达，正在防抖并拍照
+                            else:
+                                if time.time() - last_capture_time > 0.8: # 等待 0.8 秒画面稳定
+                                    print(f"📸 正在获取第 {scan_current_step + 1}/{SCAN_STEPS} 个视角的点云...")
+                                    
+                                    current_point_cloud = BodyPointCloud_dual.global_latest_verts
+                                    current_colors = BodyPointCloud_dual.global_latest_colors 
+                                    
+                                    if current_point_cloud is not None:
+                                        # ✂️ 空间裁剪 (保留桌面上方有效范围)
+                                        bbox_mask = (
+                                            (current_point_cloud[:, 2] > 0.1) & (current_point_cloud[:, 2] < 1.5) & 
+                                            (current_point_cloud[:, 0] > -0.8) & (current_point_cloud[:, 0] < 0.8)
+                                        )
+                                        p_crop = current_point_cloud[bbox_mask]
+                                        c_crop = current_colors[bbox_mask]
+
+                                        # 坐标转换并拼合
+                                        verts_robot_base = camera2unity.point_cloud_camera_to_robot(
+                                            p_crop, ee_pos, ee_quat, EE_T_C
+                                        )
+                                        scene_mapper.add_point_cloud(verts_robot_base, c_crop)
+                                        print(f"   ✅ 节点 {scan_current_step + 1} 拼合成功。")
+                                    else:
+                                        print(f"   ⚠️ 节点 {scan_current_step + 1} 数据获取失败，跳过。")
+                                        
+                                    # 准备前往下一个点
+                                    scan_current_step += 1
+                                    
+                                    if scan_current_step < SCAN_STEPS:
+                                        if robot is not None:
+                                            robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
+                                        last_capture_time = 0.0 # 🌟 切回“正在移动”状态
+                                    else:
+                                        print("\n🎉 [HRI] 全自动扫描任务完成！地图已生成。")
+                                        print("👀 切换至状态 4: 请通过眼动凝视选择目标物体...")
+                                        current_hri_state = STATE_GAZE_INTERSECTION
+                                        hri_start_time = 0.0
+                            
+                elif current_hri_state == STATE_GAZE_INTERSECTION:
+                    
+                    if hri_start_time == 0.0:
+                        print("👀 [HRI] 状态 4: 请凝视你要抓取的物体 (持续 2 秒)...")
                         hri_start_time = time.time()
                         debug_print_time = time.time() 
                         
-                        # 初始化凝视变量
                         fixation_point = None       
                         fixation_start_time = 0.0   
                         FIXATION_TOLERANCE = 0.05   
                         FIXATION_TIME_REQUIRED = 2.0 
                         
                     else:
+                        # 必须保留，防止 3D 窗口卡死
+                        scene_mapper.update_window() 
+                        
+                        # 获取已经建好的整块静态地图
+                        verts_robot_base = scene_mapper.get_merged_points_numpy()
                         current_pt = None
                         
-                        # ==========================================
-                        # 1. 🌟 跨文件拿点云！(确保你文件顶部 import 了它)
-                        # ==========================================
-                        if current_point_cloud is None:
-                            print(f"getting latest")
-                            current_point_cloud = BodyPointCloud_dual.global_latest_verts
-
-                        verts_robot_base = None
-                        if current_point_cloud is not None:
-                            ee_pos, ee_quat = robot_listener.get_current_pose()
-                            if ee_pos is not None and ee_quat is not None:
-                                verts_robot_base = camera2unity.point_cloud_camera_to_robot(
-                                    current_point_cloud, ee_pos, ee_quat, EE_T_C
-                                )
-                        
-                        # 2. 只有当起点、终点、点云这三兄弟都到齐了，才算交点
-                        if global_ray_origin is not None and global_ray_hit is not None and current_point_cloud is not None:
+                        # 眼动求交
+                        if global_ray_origin is not None and global_ray_hit is not None and verts_robot_base is not None:
                             current_pt = get_gaze_point_cloud_intersection(
                                 ray_origin=global_ray_origin, 
                                 ray_hit_pos=global_ray_hit, 
                                 point_cloud=verts_robot_base, 
-                                radius=0.01 # 容差半径，打不中物体可以适当调大到 0.08
+                                radius=0.01 
                             )
                             
-                        # ==========================================
-                        # 🛠️ 调试信息打印 (每 0.5 秒打印一次防刷屏)
-                        # ==========================================
+                        # 调试打印防刷屏
                         if time.time() - debug_print_time > 0.5:
-                            print("\n" + "-" * 40)
-                            if verts_robot_base is None:
-                                print(f"No point cloud")
-                            if global_ray_origin is not None and global_ray_hit is not None:
-                                print(f"👀 [Debug] 射线起点: {np.round(global_ray_origin, 3)} | 终点: {np.round(global_ray_hit, 3)}")
-                            
                             if current_pt is not None:
-                                print(f"🎯 [Debug] 击中点云！物理交点 : {np.round(current_pt, 3)}")
-                            elif current_point_cloud is None:
-                                print(f"⚠️ [Debug] 正在等待相机线程吐出有效点云...")
-                            else:
-                                print(f"❌ [Debug] 射线未击中点云 (视线可能移开了，或目标表面太反光)")
-                            print("-" * 40)
+                                print(f"🎯 [Debug] 击中物体！交点 : {np.round(current_pt, 3)}")
                             debug_print_time = time.time()
-                        # ==========================================
 
-                        # 3. 凝视确认逻辑 (仅在击中物体时运行)
+                        # 凝视确认逻辑
                         if current_pt is not None:
                             if fixation_point is None:
                                 fixation_point = current_pt
                                 fixation_start_time = time.time()
-                                print(" ⏱️ [HRI] 检测到视线落点，开始凝视计时...")
-                                
+                                print(" ⏱️ 开始凝视计时...")
                             else:
-                                # 计算视线偏移距离
                                 dist = np.linalg.norm(current_pt - fixation_point)
-                                
-                                # 判断是否在容差范围内 (没乱看)
                                 if dist < FIXATION_TOLERANCE:
                                     dwell_time = time.time() - fixation_start_time
-                                    
-                                    # 满足 2 秒！触发确认！
                                     if dwell_time >= FIXATION_TIME_REQUIRED:
-                                        print(f"\n 🎉 [HRI] 凝视确认成功！锁定目标坐标: {np.round(fixation_point, 3)}")
-                                        print(" 🚀 [HRI] 准备执行抓取动作...\n")
-
-                                        # 将机器人坐标系的交点，倒推回 Unity 坐标系并发送
+                                        print(f"\n 🎉 凝视确认！锁定目标: {np.round(fixation_point, 3)}")
                                         if T_M is not None:
                                             try:
                                                 u_target = rut.robot2unity_transform(fixation_point, T_M)
-                                                
                                                 packet = b't' + struct.pack('<fff', u_target[0], u_target[1], u_target[2])
                                                 conn.sendall(packet)
-                                                print(f" 📡 [TCP] 已将目标坐标 {np.round(u_target, 3)} 发给 Unity 生成全息标记！")
+                                                print(f" 📡 发送至 Unity: {np.round(u_target, 3)}")
                                             except Exception as e:
-                                                print(f" ❌ [TCP] 发送 Unity 坐标失败: {e}")
+                                                pass
                                         
-                                        # 可选：让机械臂先移到物体正上方准备
-                                        # if robot is not None:
-                                        #     hover_pose = [fixation_point[0], fixation_point[1], fixation_point[2] + 0.1]
-                                        #     robot.move_to(hover_pose, speed=0.03)
-                                        
-                                        # 状态流转：前往下一个动作
-                                        current_hri_state = STATE_GRAB_OBJECT 
+                                        #current_hri_state = STATE_GRAB_OBJECT # 🚀 切换到抓取状态
                                         hri_start_time = 0.0
-                                        
-                                # 眼睛看向了别的地方，重置凝视点和计时器
                                 else:
                                     fixation_point = current_pt
                                     fixation_start_time = time.time()
-                                    
-                        # 如果视线落在了没有点云的虚空，直接打断计时
                         else:
                             fixation_point = None
                             fixation_start_time = 0.0
-
-                        # # 4. 全局超时逻辑：15 秒没选出来，自动放弃
-                        # if time.time() - hri_start_time > 15.0:
-                        #     print(" ⏲️ [HRI] 15秒内未完成凝视确认，放弃本次抓取。")
-                        #     if robot is not None:
-                        #         robot.move_to(INIT_POSE, speed=0.05)
-                        #     current_hri_state = STATE_IDLE
-                        #     hri_start_time = 0.0
 
                 
     except Exception as e:
