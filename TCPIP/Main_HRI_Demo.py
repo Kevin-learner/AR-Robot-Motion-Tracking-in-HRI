@@ -8,6 +8,7 @@ import time
 import cv2
 from scipy.spatial.transform import Rotation as R
 from collections import deque
+import open3d as o3d
 
 # netsh interface portproxy add v4tov4 listenaddress=192.168.137.1 listenport=[本地监听端口] connectaddress=[机械臂的Tailscale IP] connectport=[机械臂服务端口]
 
@@ -407,9 +408,9 @@ def main():
     # ====== Multipointcloud test ======
     # 这里使用的是 [x, y, z, qx, qy, qz, qw] 或关节角，只要符合你的 robot.move_to 格式即可
 
-    SCAN_START_POSE = [-0.1340, 0.5319, 0.3668, -0.91, -0.41, -0.00, 0.05]
-    SCAN_END_POSE   = [0.2765, 0.5066, 0.3488, -0.95, -0.32, -0.05, 0.00]
-    SCAN_STEPS = 8  # 直线上拍 4 张照片（起点、2个中间点、终点）
+    SCAN_START_POSE = [-0.1340, 0.5319, 0.4668, -0.91, -0.41, -0.00, 0.05]
+    SCAN_END_POSE   = [0.2765, 0.5066, 0.4588, -0.95, -0.32, -0.05, 0.00]
+    SCAN_STEPS = 10  # 直线上拍 4 张照片（起点、2个中间点、终点）
 
 
     scan_waypoints = []
@@ -1221,11 +1222,51 @@ def main():
                                             robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
                                         last_capture_time = 0.0 # 🌟 切回“正在移动”状态
                                     else:
-                                        print("\n🎉 [HRI] 全自动扫描任务完成！地图已生成。")
-                                        print("👀 切换至状态 4: 请通过眼动凝视选择目标物体...")
+                                        print("\n🎉 [HRI] 全自动扫描任务完成！正在处理点云数据...")
+                                        
+                                        final_pcd = scene_mapper.global_pcd
+                                        print("   🧹 1. 正在执行统计学滤波降噪...")
+                                        cleaned_pcd, _ = final_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+                                        
+                                        # 🌟 关键 1：把包含桌子的完整地图留给 Open3D 显示，用来接住你的视线！
+                                        scene_mapper.global_pcd = cleaned_pcd
+                                        scene_mapper.display_pcd.points = cleaned_pcd.points
+                                        scene_mapper.display_pcd.colors = cleaned_pcd.colors
+                                        scene_mapper.update_window()
+                                        
+                                        print("   🪚 2. 正在识别桌面 (RANSAC)...")
+                                        plane_model, inliers = cleaned_pcd.segment_plane(distance_threshold=0.015, ransac_n=3, num_iterations=1000)
+                                        objects_pcd = cleaned_pcd.select_by_index(inliers, invert=True)
+
+                                        # ==========================================
+                                        # 提取并保存桌面的绝对 Z 高度
+                                        # ==========================================
+                                        table_points = np.asarray(cleaned_pcd.select_by_index(inliers).points)
+                                        scene_mapper.table_z = np.mean(table_points[:, 2]) 
+                                        print(f"   📏 测得桌面绝对物理高度: Z = {scene_mapper.table_z:.4f} 米")
+                                        # ==========================================
+                                        
+                                        print("   📦 3. 正在聚类并【彻底删除噪点】(DBSCAN)...")
+                                        labels = np.array(objects_pcd.cluster_dbscan(eps=0.03, min_points=50))
+                                        
+                                        # 提取纯净盒子 (剔除 -1 噪点)
+                                        valid_mask = labels >= 0  
+                                        clean_objects_pcd = objects_pcd.select_by_index(np.where(valid_mask)[0])
+                                        clean_labels = labels[valid_mask]
+                                        
+                                        # 🌟 关键 2：把纯净的盒子单独存进一个变量里，当做“磁铁”
+                                        scene_mapper.objects_pcd = clean_objects_pcd
+                                        scene_mapper.object_labels = clean_labels
+                                        
+                                        print(f"   ✅ 物品提取完毕！共发现 {clean_labels.max() + 1 if len(clean_labels)>0 else 0} 个纯净物体。")
+                                        
+                                        print("\n👀 切换至状态 4: 请通过眼动凝视选择目标物体...")
                                         current_hri_state = STATE_GAZE_INTERSECTION
                                         hri_start_time = 0.0
                             
+                # -----------------------------------
+                # 状态 4：全景眼动求交 + 纯净物品吸附
+                # -----------------------------------
                 elif current_hri_state == STATE_GAZE_INTERSECTION:
                     
                     if hri_start_time == 0.0:
@@ -1239,51 +1280,97 @@ def main():
                         FIXATION_TIME_REQUIRED = 2.0 
                         
                     else:
-                        # 必须保留，防止 3D 窗口卡死
                         scene_mapper.update_window() 
-                        
-                        # 获取已经建好的整块静态地图
-                        verts_robot_base = scene_mapper.get_merged_points_numpy()
                         current_pt = None
                         
-                        # 眼动求交
+                        # 🎯 1. 射线跟【完整大地图（含桌子）】求交！保证红球绝不消失！
+                        verts_robot_base = scene_mapper.get_merged_points_numpy()
                         if global_ray_origin is not None and global_ray_hit is not None and verts_robot_base is not None:
                             current_pt = get_gaze_point_cloud_intersection(
                                 ray_origin=global_ray_origin, 
                                 ray_hit_pos=global_ray_hit, 
                                 point_cloud=verts_robot_base, 
-                                radius=0.01 
+                                radius=0.02 
                             )
                             
-                        # 调试打印防刷屏
+                        scene_mapper.update_marker(current_pt)
+                        
                         if time.time() - debug_print_time > 0.5:
                             if current_pt is not None:
-                                print(f"🎯 [Debug] 击中物体！交点 : {np.round(current_pt, 3)}")
+                                print(f"🎯 [Debug] 视线落点 : {np.round(current_pt, 3)}")
                             debug_print_time = time.time()
 
-                        # 凝视确认逻辑
+                        # 🎯 2. 凝视确认与“智能吸附”
                         if current_pt is not None:
                             if fixation_point is None:
                                 fixation_point = current_pt
                                 fixation_start_time = time.time()
-                                print(" ⏱️ 开始凝视计时...")
                             else:
                                 dist = np.linalg.norm(current_pt - fixation_point)
                                 if dist < FIXATION_TOLERANCE:
                                     dwell_time = time.time() - fixation_start_time
+                                    
+                                    # 盯住 2 秒了！开始吸附盒子！
                                     if dwell_time >= FIXATION_TIME_REQUIRED:
-                                        print(f"\n 🎉 凝视确认！锁定目标: {np.round(fixation_point, 3)}")
-                                        if T_M is not None:
-                                            try:
-                                                u_target = rut.robot2unity_transform(fixation_point, T_M)
-                                                packet = b't' + struct.pack('<fff', u_target[0], u_target[1], u_target[2])
-                                                conn.sendall(packet)
-                                                print(f" 📡 发送至 Unity: {np.round(u_target, 3)}")
-                                            except Exception as e:
-                                                pass
                                         
-                                        #current_hri_state = STATE_GRAB_OBJECT # 🚀 切换到抓取状态
-                                        hri_start_time = 0.0
+                                        if hasattr(scene_mapper, 'objects_pcd') and not scene_mapper.objects_pcd.is_empty():
+                                            # 🧲 去【纯净盒子地图】里找离当前落点最近的点
+                                            kdtree = o3d.geometry.KDTreeFlann(scene_mapper.objects_pcd)
+                                            _, idx, sq_dist = kdtree.search_knn_vector_3d(fixation_point, 1)
+                                            
+                                            distance_to_box = np.sqrt(sq_dist[0])
+                                            
+                                            # 如果你看的地方方圆 20 厘米内根本没有盒子，说明你在看空桌子，放弃抓取
+                                            if distance_to_box > 0.20:
+                                                print(f"\n ⚠️ 视线落点周围没有盒子，请看向盒子！")
+                                                fixation_point = None
+                                                fixation_start_time = time.time()
+                                                continue
+                                                
+                                            # 成功吸附！获取盒子 ID（因为噪点被删了，这里必定是有效盒子）
+                                            box_id = scene_mapper.object_labels[idx[0]]
+                                            
+                                            # 📦 提取这整个盒子的所有点，计算几何中心
+                                            box_indices = np.where(scene_mapper.object_labels == box_id)[0]
+                                            box_points = np.asarray(scene_mapper.objects_pcd.points)[box_indices]
+
+                                            # 1. 将 numpy 数组转为 Open3D 点云对象
+                                            single_box_pcd = o3d.geometry.PointCloud()
+                                            single_box_pcd.points = o3d.utility.Vector3dVector(box_points)
+
+                                            # 2. 计算有向包围盒 (OBB)
+                                            obb = single_box_pcd.get_oriented_bounding_box()
+
+                                            # 3. 获取真正的几何中心 (这比 np.mean 准得多！)
+                                            box_center = obb.center
+
+                                            # 4. 获取盒子的长宽高尺寸 (用于决定夹爪张开多大)
+                                            box_size = obb.extent 
+                                            print(f"📦 盒子尺寸: 长宽高 {np.round(box_size, 3)} 米")
+
+                                            # 5. 获取盒子的旋转矩阵 (用于对齐夹爪姿态！)
+                                            box_rotation = obb.R
+                                            
+                                            print(f"\n 🎉 成功吸附！目标锁定为 [盒子 {box_id}]")
+                                            print(f" 🎯 盒子几何中心坐标: {np.round(box_center, 3)}")
+                                            
+                                            if T_M is not None:
+                                                try:
+                                                    u_target = rut.robot2unity_transform(box_center, T_M)
+                                                    packet = b't' + struct.pack('<fff', u_target[0], u_target[1], u_target[2])
+                                                    conn.sendall(packet)
+                                                except Exception:
+                                                    pass
+                                            
+                                            scene_mapper.target_box_points = box_points
+                                            
+                                            current_hri_state = STATE_GRAB_OBJECT 
+                                            hri_start_time = 0.0
+                                            
+                                        else:
+                                            print("⚠️ 场景中没有找到任何盒子！")
+                                            fixation_point = None
+                                            fixation_start_time = time.time()
                                 else:
                                     fixation_point = current_pt
                                     fixation_start_time = time.time()
@@ -1291,6 +1378,98 @@ def main():
                             fixation_point = None
                             fixation_start_time = 0.0
 
+                # -----------------------------------
+                # 状态 5：高精度纯几何抓取 (Kinematic Grasp)
+                # -----------------------------------
+                elif current_hri_state == STATE_GRAB_OBJECT:
+                    
+                    if hri_start_time == 0.0:
+                        print("\n" + "="*50)
+                        print("🦾 [HRI] 状态 5: 开始执行纯视觉几何抓取...")
+                        
+                        # 1. 获取目标盒子点云，计算 OBB 包围盒
+                        box_pcd = o3d.geometry.PointCloud()
+                        box_pcd.points = o3d.utility.Vector3dVector(scene_mapper.target_box_points)
+                        obb = box_pcd.get_oriented_bounding_box()
+                        
+                        # 2. 🌟 降维打击计算坐标：X/Y 相信 OBB，Z 相信桌面！
+                        center_x, center_y, _ = obb.center
+                        
+                        # 盒子的最高点 Z (结合桌面高度，算出真实的物理最高点)
+                        box_top_z = np.max(scene_mapper.target_box_points[:, 2])
+                        box_actual_height = box_top_z - getattr(scene_mapper, 'table_z', 0.0)
+                        
+                        # 设定抓取点 (比如从盒子最高点往下探 2 厘米)
+                        GRASP_DEPTH = 0.02
+                        target_z = box_top_z - GRASP_DEPTH
+                        
+                        print(f"   📦 目标中心: X={center_x:.3f}, Y={center_y:.3f}")
+                        print(f"   📏 目标高度: {box_actual_height*100:.1f} cm (抓取深度 Z={target_z:.3f})")
+                        
+                        # 3. 定义夹爪朝下的固定四元数 (请替换为你实际夹爪垂直朝下的位姿！)
+                        GRASP_ROT = [-1.0, 0.0, 0.0, 0.0] 
+                        
+                        # 4. 生成三段式关键点，并安全地挂载到 scene_mapper 上！
+                        scene_mapper.hover_pose = [center_x, center_y, target_z + 0.15] + GRASP_ROT # 悬停点
+                        scene_mapper.grasp_pose = [center_x, center_y, target_z + 0.10] + GRASP_ROT        # 抓取点
+                        scene_mapper.lift_pose  = [center_x, center_y, target_z + 0.20] + GRASP_ROT # 提拉点
+                        
+                        # 5. 立刻派发第一阶段：飞往悬停点
+                        print("   -> 🛫 阶段 1：飞往正上方悬停...")
+                        if robot is not None:
+                            robot.move_to(scene_mapper.hover_pose, speed=0.03) 
+                            
+                        scene_mapper.grasp_step = 1       # 控制抓取阶段的变量
+                        hri_start_time = time.time()
+                        
+                    else:
+                        # -----------------------------------
+                        # 阶段 2：飞到上方后，张开夹爪，然后缓慢下探
+                        # -----------------------------------
+                        if getattr(scene_mapper, 'grasp_step', 0) == 1 and time.time() - hri_start_time > 3.0:
+                            
+                            # 🌟 先张开夹爪！
+                            if robot is not None:
+                                robot.open_gripper(width=0.08) # 张开 8 厘米
+                                
+                            print("   -> 🛬 阶段 2：夹爪已张开，开始直线缓慢下压...")
+                            if robot is not None:
+                                robot.move_to(scene_mapper.grasp_pose, speed=0.01) 
+                                
+                            scene_mapper.grasp_step = 2
+                            hri_start_time = time.time()
+                            
+                        # -----------------------------------
+                        # 阶段 3：到达底部，闭合夹爪
+                        # -----------------------------------
+                        elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 2.5:
+                            print("   -> ✊ 阶段 3：接触目标，正在闭合夹爪...")
+                            
+                            # 🌟 抓紧盒子！
+                            if robot is not None:
+                                robot.close_gripper(force=30.0) # 施加 30N 的抓取力
+                            
+                            scene_mapper.grasp_step = 3
+                            hri_start_time = time.time()
+                            
+                        # -----------------------------------
+                        # 阶段 4：抓稳后，向上提拉
+                        # -----------------------------------
+                        elif getattr(scene_mapper, 'grasp_step', 0) == 3 and time.time() - hri_start_time > 1.5: 
+                            print("   -> 🚀 阶段 4：提拉物品...")
+                            if robot is not None:
+                                robot.move_to(scene_mapper.lift_pose, speed=0.01)
+                                
+                            scene_mapper.grasp_step = 4
+                            hri_start_time = time.time()
+                            
+                        # -----------------------------------
+                        # 任务完成，重置状态
+                        # -----------------------------------
+                        elif getattr(scene_mapper, 'grasp_step', 0) == 4 and time.time() - hri_start_time > 3.0:
+                            print("\n🎉 [HRI] 完美抓取！任务链执行完毕。返回待机状态。")
+                            #current_hri_state = STATE_IDLE
+                            #hri_start_time = 0.0
                 
     except Exception as e:
         print(f"[TCP] Server Error: {e}")

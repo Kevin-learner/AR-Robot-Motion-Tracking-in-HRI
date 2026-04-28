@@ -69,7 +69,18 @@ class PointCloudAccumulator:
         # 创建一个专用于显示的代理点云
         self.display_pcd = o3d.geometry.PointCloud()
         self.vis.add_geometry(self.display_pcd)
+
+        # ==========================================
+        # 🌟 新增：创建一个用于标记视线交点的红色小球
+        # ==========================================
+        self.marker_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.015) # 半径 1.5 厘米
+        self.marker_sphere.paint_uniform_color([0.0, 1.0, 0.0]) # 纯红色
+        self.marker_sphere.translate([0, 0, 0], relative=False) # 初始先把它藏到 100 米外
+        self.vis.add_geometry(self.marker_sphere)
+        # ==========================================
+
         self.first_render = True
+
 
     # 注意这里多加了一个 point_colors 参数
     def add_point_cloud(self, points_robot_base, point_colors):
@@ -120,3 +131,15 @@ class PointCloudAccumulator:
         self.vis.update_geometry(self.display_pcd)
         self.is_empty = True
         self.frame_count = 0
+
+    def update_marker(self, position):
+        """将红色小球瞬移到用户视线交点的位置"""
+        if position is not None:
+            # relative=False 表示按照绝对坐标进行平移
+            self.marker_sphere.translate(position, relative=False)
+        else:
+            # 如果没看中任何东西，就把小球藏起来
+            self.marker_sphere.translate([0, 0, 0], relative=False)
+            
+        # 告诉 Open3D 小球位置变了，需要重新渲染
+        self.vis.update_geometry(self.marker_sphere)

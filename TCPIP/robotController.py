@@ -7,6 +7,12 @@ import tf
 import math
 from queue import Queue
 from tf.transformations import quaternion_slerp, quaternion_about_axis, quaternion_multiply
+try:
+    from franka_gripper.msg import GraspAction, GraspGoal, MoveAction, MoveGoal
+except ImportError:
+    print("⚠️ 警告: 未找到 franka_gripper 环境，请确保已 source ROS 工作空间！")
+import time
+import actionlib
 
 class RobotController:
     def __init__(self):
@@ -50,6 +56,19 @@ class RobotController:
         self.worker_thread = threading.Thread(target=self._tape_player_executor)
         self.worker_thread.setDaemon(True)
         self.worker_thread.start()
+
+        # ==========================================
+        # 🌟 初始化 Franka 夹爪 Action 客户端
+        # ==========================================
+        print(">> 正在连接 Franka 夹爪服务...")
+        self.move_client = actionlib.SimpleActionClient('/franka_gripper/move', MoveAction)
+        self.grasp_client = actionlib.SimpleActionClient('/franka_gripper/grasp', GraspAction)
+        
+        # 等待服务上线 (设 2 秒超时，防止如果没有开真机导致程序卡死)
+        if self.move_client.wait_for_server(rospy.Duration(2.0)):
+            print(">> ✅ Franka 夹爪连接成功！")
+        else:
+            print(">> ⚠️ 未检测到夹爪服务，将以模拟模式运行。")
 
 
         print(f"⏳ [Robot] 等待 TF 变换...")
@@ -233,3 +252,51 @@ class RobotController:
         target_rot = pose[3:7]
         path_list = [{'pos': target_pos, 'rot': target_rot}]
         self.execute_path(path_list, speed)
+
+    # ==========================================
+    # 🌟 Franka 夹爪控制接口
+    # ==========================================
+    def open_gripper(self, width=0.08, speed=0.1):
+        """
+        张开 Franka 夹爪 (最大 0.08 米)
+        """
+        print(f"🫱 [Franka] 正在张开夹爪 (宽度: {width*100}cm)...")
+        
+        if hasattr(self, 'move_client') and self.move_client.wait_for_server(rospy.Duration(0.1)):
+            goal = MoveGoal()
+            goal.width = width
+            goal.speed = speed
+            self.move_client.send_goal(goal)
+            self.move_client.wait_for_result()
+            print("   ✅ 夹爪已完全张开。")
+        else:
+            # 脱机调试时的假动作
+            time.sleep(1.0) 
+            print("   ✅ [模拟] 夹爪已张开。")
+
+
+    def close_gripper(self, force=30.0, speed=0.1, expected_width=0.03):
+        """
+        闭合 Franka 夹爪抓取物品
+        :param force: 抓取力 (建议 20N ~ 50N，最大70N)
+        :param expected_width: 预计物体的宽度(米)。Franka 会在这个宽度附近启用力控。
+        """
+        print(f"✊ [Franka] 正在闭合抓取 (目标力: {force}N, 预期宽度: {expected_width*100}cm)...")
+        
+        if hasattr(self, 'grasp_client') and self.grasp_client.wait_for_server(rospy.Duration(0.1)):
+            goal = GraspGoal()
+            goal.width = expected_width # 告诉夹爪盒子大概多宽
+            goal.speed = speed
+            goal.force = force
+            
+            # Epsilon 是容差。意思是：在 expected_width 的内外各 4cm 范围内感受到阻力，都算抓取成功
+            goal.epsilon.inner = 0.04 
+            goal.epsilon.outer = 0.04 
+            
+            self.grasp_client.send_goal(goal)
+            self.grasp_client.wait_for_result()
+            print("   ✅ 夹爪已施加力控抓紧。")
+        else:
+            # 脱机调试时的假动作
+            time.sleep(1.0) 
+            print("   ✅ [模拟] 夹爪已抓紧。")
