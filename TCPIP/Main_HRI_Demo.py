@@ -398,7 +398,7 @@ def main():
     DEADZONE_M = 0.05 # 5cm死区，人在画面中心 5cm 内机械臂不动
 
     intent_history = deque(maxlen=30)
-    LOOK_AT_TABLE_POSE = [0.2766, 0.5236, 0.4433, -0.95, -0.32, -0.01, 0.05]
+    LOOK_AT_TABLE_POSE = [0.6321, 0.2207, 0.5051, 0.92, -0.40, 0.01, 0.00] #[INFO] [1777634020.049898]: sent #1 UPDATED d=0.000000 xyz=(0.5792, 0.2653, 0.5375) Euler[Deg]=(Rx:-175.8, Ry:-3.4, Rz:-49.6) q=(0.91, -0.42, 0.04, -0.02)
 
     # 存放最新的全局坐标系下的眼动射线
     global_ray_origin = None 
@@ -408,22 +408,28 @@ def main():
     # ====== Multipointcloud test ======
     # 这里使用的是 [x, y, z, qx, qy, qz, qw] 或关节角，只要符合你的 robot.move_to 格式即可
 
-    SCAN_START_POSE = [-0.1340, 0.5319, 0.4668, -0.91, -0.41, -0.00, 0.05]
-    SCAN_END_POSE   = [0.2765, 0.5066, 0.4588, -0.95, -0.32, -0.05, 0.00]
-    SCAN_STEPS = 10  # 直线上拍 4 张照片（起点、2个中间点、终点）
+    SCAN_START_POSE = [0.5792, 0.2653, 0.5375, 0.91, -0.42, 0.04, -0.02]
+    SCAN_END_POSE   = [0.5621, -0.1739, 0.5375, -0.92, 0.38, -0.04, -0.01] #[INFO] [1777634168.026776]: sent #149 UPDATED d=0.000223 xyz=(0.5621, -0.1739, 0.5610) Euler[Deg]=(Rx:-179.5, Ry:-4.6, Rz:-45.0) q=(-0.92, 0.38, -0.04, -0.01)
+    SCAN_STEPS = 6  # 直线上拍 4 张照片（起点、2个中间点、终点）
 
+    SCAN_ARC_HEIGHT = 0.04
 
     scan_waypoints = []
-
     for i in range(SCAN_STEPS):
         ratio = i / (SCAN_STEPS - 1)
-        # 简单的线性插值
+        
+        # 1. 正常的线性插值
         interpolated_pose = [
             SCAN_START_POSE[j] + ratio * (SCAN_END_POSE[j] - SCAN_START_POSE[j])
             for j in range(len(SCAN_START_POSE))
         ]
+        
+        # 2. 🌟 核心魔法：将抛物线高度直接“烘焙”到 Z 轴坐标里！
+        if SCAN_ARC_HEIGHT > 0.0:
+            # 公式：4 * h * x * (1-x)，两端为 0，中间最高
+            interpolated_pose[2] += SCAN_ARC_HEIGHT * 4.0 * ratio * (1.0 - ratio)
+            
         scan_waypoints.append(interpolated_pose)
-
 
     scan_current_step = 0 # 记录走到第几个点了
   
@@ -1030,18 +1036,18 @@ def main():
                 if current_hri_state == STATE_IDLE:
                     if robot is None:
                         robot = RobotController()
-                    # print("\n" + "="*50)
-                    # print("🤖 [HRI] 收到指令，启动人机交互流程！")
-                    # current_hri_state = STATE_INIT # 切入状态 0
-                    # print("="*50 + "\n")
-
                     print("\n" + "="*50)
-                    print("🤖 [HRI] 测试模式：跳过跟踪，直接进入状态 3 (物品凝视)！")
-                    
-                    current_hri_state = STATE_SCAN_OBJECTS  # 🌟 直接空降状态 3！
-                    hri_start_time = 0.0                    # 确保重置计时器
-                    
+                    print("🤖 [HRI] 收到指令，启动人机交互流程！")
+                    current_hri_state = STATE_INIT # 切入状态 0
                     print("="*50 + "\n")
+
+                    # print("\n" + "="*50)
+                    # print("🤖 [HRI] 测试模式：跳过跟踪，直接进入状态 3 (物品凝视)！")
+                    
+                    # current_hri_state = STATE_SCAN_OBJECTS  # 🌟 直接空降状态 3！
+                    # hri_start_time = 0.0                    # 确保重置计时器
+                    
+                    # print("="*50 + "\n")
                 
                 # 0. 初始位姿状态：机械臂前往预设的初始位置，等待 5 秒让用户观察
                 elif current_hri_state == STATE_INIT:
@@ -1146,7 +1152,7 @@ def main():
                         
                     else:
                         # 非阻塞等待机械臂走到位 (这里给 4 秒时间，可根据实际距离调整)
-                        if time.time() - hri_start_time > 4.0:
+                        if time.time() - hri_start_time > 10.0:
                             print(" ✅ [HRI] 视线已锁定桌面！准备进入物品识别 (State 3)...")
                             current_hri_state = STATE_SCAN_OBJECTS
                             hri_start_time = 0.0
@@ -1225,6 +1231,14 @@ def main():
                                         print("\n🎉 [HRI] 全自动扫描任务完成！正在处理点云数据...")
                                         
                                         final_pcd = scene_mapper.global_pcd
+
+                                        print("   ✂️ 0. 正在进行 Z 轴高度直通滤波 (保留 Z >= 0)...")
+                                        points = np.asarray(final_pcd.points)
+                                        # 找到所有 Z 坐标大于等于 0 的点的索引
+                                        valid_z_indices = np.where(points[:, 2] >= 0.0)[0] 
+                                        # 根据索引裁剪点云
+                                        final_pcd = final_pcd.select_by_index(valid_z_indices)
+
                                         print("   🧹 1. 正在执行统计学滤波降噪...")
                                         cleaned_pcd, _ = final_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
                                         
@@ -1356,9 +1370,11 @@ def main():
                                             
                                             if T_M is not None:
                                                 try:
+                                                    print("box position sent to unity")
                                                     u_target = rut.robot2unity_transform(box_center, T_M)
                                                     packet = b't' + struct.pack('<fff', u_target[0], u_target[1], u_target[2])
                                                     conn.sendall(packet)
+                                                    time.sleep(0.01)
                                                 except Exception:
                                                     pass
                                             
@@ -1400,18 +1416,18 @@ def main():
                         box_actual_height = box_top_z - getattr(scene_mapper, 'table_z', 0.0)
                         
                         # 设定抓取点 (比如从盒子最高点往下探 2 厘米)
-                        GRASP_DEPTH = 0.02
+                        GRASP_DEPTH = -0.02
                         target_z = box_top_z - GRASP_DEPTH
                         
                         print(f"   📦 目标中心: X={center_x:.3f}, Y={center_y:.3f}")
                         print(f"   📏 目标高度: {box_actual_height*100:.1f} cm (抓取深度 Z={target_z:.3f})")
                         
                         # 3. 定义夹爪朝下的固定四元数 (请替换为你实际夹爪垂直朝下的位姿！)
-                        GRASP_ROT = [-1.0, 0.0, 0.0, 0.0] 
+                        GRASP_ROT = [-0.92, 0.38, -0.01, -0.00] 
                         
                         # 4. 生成三段式关键点，并安全地挂载到 scene_mapper 上！
                         scene_mapper.hover_pose = [center_x, center_y, target_z + 0.15] + GRASP_ROT # 悬停点
-                        scene_mapper.grasp_pose = [center_x, center_y, target_z + 0.10] + GRASP_ROT        # 抓取点
+                        scene_mapper.grasp_pose = [center_x, center_y, target_z ] + GRASP_ROT        # 抓取点
                         scene_mapper.lift_pose  = [center_x, center_y, target_z + 0.20] + GRASP_ROT # 提拉点
                         
                         # 5. 立刻派发第一阶段：飞往悬停点
@@ -1423,10 +1439,14 @@ def main():
                         hri_start_time = time.time()
                         
                     else:
+                        # 🌟 新增：获取机械臂是否处于空闲状态 (动作是否执行完毕)
+                        is_robot_idle = robot.path_queue.empty() if robot is not None else True
+
                         # -----------------------------------
                         # 阶段 2：飞到上方后，张开夹爪，然后缓慢下探
                         # -----------------------------------
-                        if getattr(scene_mapper, 'grasp_step', 0) == 1 and time.time() - hri_start_time > 3.0:
+                        # 修改条件：等待至少 1 秒（防止队列还没塞进去就误判）并且 机械臂动作已走完！
+                        if getattr(scene_mapper, 'grasp_step', 0) == 1 and time.time() - hri_start_time > 1.0 and is_robot_idle:
                             
                             # 🌟 先张开夹爪！
                             if robot is not None:
@@ -1434,7 +1454,7 @@ def main():
                                 
                             print("   -> 🛬 阶段 2：夹爪已张开，开始直线缓慢下压...")
                             if robot is not None:
-                                robot.move_to(scene_mapper.grasp_pose, speed=0.01) 
+                                robot.move_to(scene_mapper.grasp_pose, speed=0.02) 
                                 
                             scene_mapper.grasp_step = 2
                             hri_start_time = time.time()
@@ -1442,7 +1462,8 @@ def main():
                         # -----------------------------------
                         # 阶段 3：到达底部，闭合夹爪
                         # -----------------------------------
-                        elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 2.5:
+                        # 修改条件：下探的动作必须完全走完，才允许闭合夹爪！
+                        elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 1.0 and is_robot_idle:
                             print("   -> ✊ 阶段 3：接触目标，正在闭合夹爪...")
                             
                             # 🌟 抓紧盒子！
@@ -1455,10 +1476,12 @@ def main():
                         # -----------------------------------
                         # 阶段 4：抓稳后，向上提拉
                         # -----------------------------------
-                        elif getattr(scene_mapper, 'grasp_step', 0) == 3 and time.time() - hri_start_time > 1.5: 
+                        # 这个阶段不用等 is_robot_idle，因为夹爪闭合(close_gripper)本身有 sleep(1.5) 阻塞，
+                        # 当代码走到这里时，夹爪肯定已经闭合完毕了。
+                        elif getattr(scene_mapper, 'grasp_step', 0) == 3 and time.time() - hri_start_time > 0.5: 
                             print("   -> 🚀 阶段 4：提拉物品...")
                             if robot is not None:
-                                robot.move_to(scene_mapper.lift_pose, speed=0.01)
+                                robot.move_to(scene_mapper.lift_pose, speed=0.03) # 提拉稍微快一点点
                                 
                             scene_mapper.grasp_step = 4
                             hri_start_time = time.time()
@@ -1466,7 +1489,7 @@ def main():
                         # -----------------------------------
                         # 任务完成，重置状态
                         # -----------------------------------
-                        elif getattr(scene_mapper, 'grasp_step', 0) == 4 and time.time() - hri_start_time > 3.0:
+                        elif getattr(scene_mapper, 'grasp_step', 0) == 4 and time.time() - hri_start_time > 1.0 and is_robot_idle:
                             print("\n🎉 [HRI] 完美抓取！任务链执行完毕。返回待机状态。")
                             #current_hri_state = STATE_IDLE
                             #hri_start_time = 0.0
