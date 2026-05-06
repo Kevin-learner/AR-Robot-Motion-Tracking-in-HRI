@@ -337,6 +337,54 @@ def check_reach_intent(skeleton_coord_camera):
     
     return left_reaching or right_reaching
 
+def send_path_to_hololens(conn, points, T_M):
+    """
+    发送动态预测路径给 HoloLens 进行实时渲染 (Header: 'w')
+    :param conn: TCP socket 连接对象
+    :param points: 机器人坐标系下的三维点列表 (List of [x, y, z] 或 np.ndarray)
+    :param T_M: 机器人到 Unity 左手系的对齐转换矩阵
+    """
+    try:
+        # 1. 如果路径为空，发送 0 个点，通知 HoloLens 清空屏幕上的线
+        if not points or len(points) == 0:
+            header = b'w'
+            payload = struct.pack('<i', 0)
+            conn.setblocking(True)
+            conn.sendall(header + payload)
+            conn.setblocking(False)
+            return
+
+        # 2. 坐标系转换 (Robot -> Unity)
+        unity_points = []
+        for pt in points:
+            # 使用你的辅助函数转为 Unity 坐标
+            u_pt = rut.robot2unity_transform(pt, T_M)
+            if u_pt is not None:
+                unity_points.append(u_pt)
+
+        # 3. 打包 Header 和 点的数量
+        header = b'w'
+        num_pts = len(unity_points)
+        payload = struct.pack('<i', num_pts) # <i 代表小端序的 4字节整型(int)
+
+        # 4. 打包所有的 XYZ 坐标点
+        flat_coords = []
+        for u_pt in unity_points:
+            flat_coords.extend([float(u_pt[0]), float(u_pt[1]), float(u_pt[2])])
+        
+        # 将展平的坐标列表一次性打包成 float 字节流 (小端序)
+        payload += struct.pack(f'<{len(flat_coords)}f', *flat_coords)
+
+        # 5. 发送数据 (极其重要：发数据前开启阻塞，发完关闭，这是非阻塞TCP的核心稳健写法)
+        conn.setblocking(True)
+        conn.sendall(header + payload)
+        conn.setblocking(False)
+
+    except BlockingIOError:
+        pass # 非阻塞模式下的系统级等待，可以直接忽略
+    except Exception as e:
+        print(f"⚠️ [TCP] 发送动态路径至 HoloLens 失败: {e}")
+
 # -------------------------------------------------
 # 3. 主循环
 # -------------------------------------------------
@@ -387,6 +435,8 @@ def main():
     STATE_SCAN_OBJECTS = 3   # 3. 扫描桌面物品
     STATE_GAZE_INTERSECTION = 4 # 4. gaze selection
     STATE_GRAB_OBJECT = 5       # 5. 抓取物品
+    STATE_LOOKING_FOR_USER = 6     # 6. 寻找用户来拿
+    STATE_TRACKING_AND_PASS = 7     # 7. 跟踪并递给用户
     
     current_hri_state = STATE_IDLE
     hri_start_time = 0.0     # 记录状态切换的时间，用于非阻塞等待
@@ -1309,6 +1359,21 @@ def main():
                             
                         scene_mapper.update_marker(current_pt)
                         
+                        # ==========================================
+                        if current_pt is not None and T_M is not None:
+                            try:
+                                u_pt = rut.robot2unity_transform(current_pt, T_M)
+                                
+                                packet_p = b't' + struct.pack('<fff', u_pt[0], u_pt[1], u_pt[2])
+                                
+                                # ⚠️ TCP 关键：发送前必须开启阻塞，发完再关掉！
+                                conn.setblocking(True)
+                                conn.sendall(packet_p)
+                                conn.setblocking(False)
+                            except Exception as e:
+                                print(f"⚠️ [TCP] 发送实时光标失败: {e}")
+                        # ==========================================
+
                         if time.time() - debug_print_time > 0.5:
                             if current_pt is not None:
                                 print(f"🎯 [Debug] 视线落点 : {np.round(current_pt, 3)}")
@@ -1368,15 +1433,15 @@ def main():
                                             print(f"\n 🎉 成功吸附！目标锁定为 [盒子 {box_id}]")
                                             print(f" 🎯 盒子几何中心坐标: {np.round(box_center, 3)}")
                                             
-                                            if T_M is not None:
-                                                try:
-                                                    print("box position sent to unity")
-                                                    u_target = rut.robot2unity_transform(box_center, T_M)
-                                                    packet = b't' + struct.pack('<fff', u_target[0], u_target[1], u_target[2])
-                                                    conn.sendall(packet)
-                                                    time.sleep(0.01)
-                                                except Exception:
-                                                    pass
+                                            # if T_M is not None:
+                                            #     try:
+                                            #         print("box position sent to unity")
+                                            #         u_target = rut.robot2unity_transform(box_center, T_M)
+                                            #         packet = b't' + struct.pack('<fff', u_target[0], u_target[1], u_target[2])
+                                            #         conn.sendall(packet)
+                                            #         time.sleep(0.01)
+                                            #     except Exception:
+                                            #         pass
                                             
                                             scene_mapper.target_box_points = box_points
                                             
@@ -1490,10 +1555,118 @@ def main():
                         # 任务完成，重置状态
                         # -----------------------------------
                         elif getattr(scene_mapper, 'grasp_step', 0) == 4 and time.time() - hri_start_time > 1.0 and is_robot_idle:
-                            print("\n🎉 [HRI] 完美抓取！任务链执行完毕。返回待机状态。")
-                            #current_hri_state = STATE_IDLE
-                            #hri_start_time = 0.0
+                            print("\n🎉 [HRI] Grab success! Passing the object to user")
+                            current_hri_state = STATE_LOOKING_FOR_USER
+                            hri_start_time = 0.0
+
+                # -----------------------------------
+                # 状态 6：寻找用户 (抬头重定位)
+                # -----------------------------------
+                elif current_hri_state == STATE_LOOKING_FOR_USER:
+                    
+                    if hri_start_time == 0.0:
+                        print("\n" + "="*50)
+                        print("🤖 [HRI] 状态 6: 抓取成功！正在抬头寻找用户...")
+                        
+                        if robot is not None:
+                            # 抬起头到预设观测位
+                            robot.move_to(LOOK_USER_POSE, speed=0.05)
+                        
+                        hri_start_time = time.time()
+                        # 清空之前的意图历史，防止误触发
+                        intent_history.clear() 
+
+                    else:
+                        # 检查机械臂是否动作完毕
+                        is_robot_idle = robot.path_queue.empty() if robot is not None else True
+                        
+                        # 如果已经抬头到位，开始利用视觉检测用户
+                        if is_robot_idle and (time.time() - hri_start_time > 2.0):
+                            
+                            # 核心：判断是否检测到人体骨架
+                            if skeleton_coord_camera is not None and len(skeleton_coord_camera) > 10:
+                                # 检查是否有有效的人体中心点
+                                l_shoulder = np.array(skeleton_coord_camera[5])
+                                r_shoulder = np.array(skeleton_coord_camera[6])
+                                
+                                if np.linalg.norm(l_shoulder) > 0.1:
+                                    print("🎯 [HRI] 已重新锁定用户！准备进入递送模式...")
+                                    
+                                    # 开启追踪模式
+                                    if robot is not None:
+                                        robot.start_tracking()
+                                        
+                                    current_hri_state = STATE_TRACKING_AND_PASS
+                                    hri_start_time = 0.0
+                            else:
+                                # 如果还没看到人，可以加一个简单的超时处理或者循环等待
+                                if time.time() - hri_start_time > 15.0:
+                                    print("⚠️ [HRI] 寻找用户超时，请出现在相机视野内！")
+                                    # 这里可以保持在状态 6 循环，直到看到人为止
                 
+                elif current_hri_state == STATE_TRACKING_AND_PASS:
+                    if skeleton_coord_camera is not None and len(skeleton_coord_camera) > 10:
+                        hand_cam = np.array(skeleton_coord_camera[10])
+                        
+                        if np.linalg.norm(hand_cam) > 0.1:
+                            ee_pos, ee_quat = robot_listener.get_current_pose()
+                            r_hand_pos = camera2unity.points_camera_to_robot([hand_cam], ee_pos, ee_quat, EE_T_C)[0]
+                            
+                            # 真实终点 (手上方的安全位置)
+                            final_target_pos = r_hand_pos + np.array([0, 0, 0.15]) 
+                            
+                            vec_to_target = final_target_pos - np.array(ee_pos)
+                            dist_to_target = np.linalg.norm(vec_to_target)
+                            
+                            # =========================================================
+                            # 🌟 1. 视觉层：规划完整路径并发送给 HoloLens
+                            # =========================================================
+                            if T_M is not None and (time.time() - last_ray_print_time > 0.1):
+                                # 生成一条包含 10 个点的完整路径 (你可以换成贝塞尔曲线让它带有弧度)
+                                full_visual_path = []
+                                num_visual_points = 10
+                                for i in range(num_visual_points + 1):
+                                    ratio = i / float(num_visual_points)
+                                    # 如果你想加抛物线弧度，可以像你之前的 SCAN_ARC_HEIGHT 那样在这里给 Z 轴加上偏移
+                                    pt = np.array(ee_pos) + ratio * vec_to_target
+                                    full_visual_path.append(pt)
+                                
+                                # 把这整条完整的路径发给 HoloLens
+                                self.send_path_to_hololens(conn, full_visual_path, T_M)
+                                last_ray_print_time = time.time()
+
+                            # =========================================================
+                            # 🦾 2. 控制层：只取眼前 5cm 的路点给底层 PID
+                            # =========================================================
+                            STEP_SIZE = 0.05
+                            if dist_to_target > STEP_SIZE:
+                                direction = vec_to_target / dist_to_target
+                                next_waypoint = np.array(ee_pos) + direction * STEP_SIZE
+                            else:
+                                next_waypoint = final_target_pos
+                                
+                            error_vec = next_waypoint - np.array(ee_pos)
+                            
+                            if robot is not None:
+                                robot.update_tracking_error(error_vec[0], error_vec[1], error_vec[2])
+
+                            # =========================================================
+                            # 🤝 3. 到达与放手检测
+                            # =========================================================
+                            user_reaching = check_reach_intent(skeleton_coord_camera) 
+                            
+                            if dist_to_target < 0.05 or user_reaching:
+                                print("🤝 [HRI] 递送完成，检测到用户接管！")
+                                robot.stop_servoing() # 停止实时伺服
+                                time.sleep(0.5)       # 稍微停顿，建立心理安全感
+                                robot.open_gripper(width=0.08) 
+                                
+                                # 清除 HoloLens 里的线条 (发个空数组过去)
+                                if T_M is not None:
+                                    self.send_path_to_hololens(conn, [], T_M)
+                                    
+                                current_hri_state = STATE_IDLE
+                                hri_start_time = 0.0
     except Exception as e:
         print(f"[TCP] Server Error: {e}")
 
