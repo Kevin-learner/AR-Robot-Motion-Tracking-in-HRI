@@ -460,7 +460,7 @@ def main():
 
     SCAN_START_POSE = [0.5792, 0.2653, 0.5375, 0.91, -0.42, 0.04, -0.02]
     SCAN_END_POSE   = [0.5621, -0.1739, 0.5375, -0.92, 0.38, -0.04, -0.01] #[INFO] [1777634168.026776]: sent #149 UPDATED d=0.000223 xyz=(0.5621, -0.1739, 0.5610) Euler[Deg]=(Rx:-179.5, Ry:-4.6, Rz:-45.0) q=(-0.92, 0.38, -0.04, -0.01)
-    SCAN_STEPS = 6  # 直线上拍 4 张照片（起点、2个中间点、终点）
+    SCAN_STEPS = 8  # 直线上拍 4 张照片（起点、2个中间点、终点）
 
     SCAN_ARC_HEIGHT = 0.04
 
@@ -494,7 +494,11 @@ def main():
         
     scene_mapper.vis.register_key_callback(ord('C'), key_callback_capture)
     scene_mapper.vis.register_key_callback(ord('c'), key_callback_capture)
+
+    LOOK_USER_POSE = [0.6097, 0.0584, 0.5640, 0.69, -0.26, 0.61, -0.28]
+    # [INFO] [1778077176.377578]: sent #8199 UPDATED d=0.000063 xyz=(0.6097, 0.0584, 0.5640) Euler[Deg]=(Rx:-98.2, Ry:-44.1, Rz:-80.3) q=(0.69, -0.26, 0.61, -0.28)
     
+
     # ===============================
 
     try:
@@ -1086,18 +1090,18 @@ def main():
                 if current_hri_state == STATE_IDLE:
                     if robot is None:
                         robot = RobotController()
-                    print("\n" + "="*50)
-                    print("🤖 [HRI] 收到指令，启动人机交互流程！")
-                    current_hri_state = STATE_INIT # 切入状态 0
-                    print("="*50 + "\n")
-
                     # print("\n" + "="*50)
-                    # print("🤖 [HRI] 测试模式：跳过跟踪，直接进入状态 3 (物品凝视)！")
-                    
-                    # current_hri_state = STATE_SCAN_OBJECTS  # 🌟 直接空降状态 3！
-                    # hri_start_time = 0.0                    # 确保重置计时器
-                    
+                    # print("🤖 [HRI] 收到指令，启动人机交互流程！")
+                    # current_hri_state = STATE_INIT # 切入状态 0
                     # print("="*50 + "\n")
+
+                    print("\n" + "="*50)
+                    print("🤖 [HRI] 测试模式：跳过跟踪，直接进入状态 6 (Looking for user)！")
+                    
+                    current_hri_state = STATE_LOOKING_FOR_USER  # 🌟 直接空降状态 3！
+                    hri_start_time = 0.0                    # 确保重置计时器
+                    
+                    print("="*50 + "\n")
                 
                 # 0. 初始位姿状态：机械臂前往预设的初始位置，等待 5 秒让用户观察
                 elif current_hri_state == STATE_INIT:
@@ -1282,10 +1286,10 @@ def main():
                                         
                                         final_pcd = scene_mapper.global_pcd
 
-                                        print("   ✂️ 0. 正在进行 Z 轴高度直通滤波 (保留 Z >= 0)...")
+                                        print("   ✂️ 0. 正在进行 Z 轴高度直通滤波 (保留 Z >= -0.25)...")
                                         points = np.asarray(final_pcd.points)
                                         # 找到所有 Z 坐标大于等于 0 的点的索引
-                                        valid_z_indices = np.where(points[:, 2] >= 0.0)[0] 
+                                        valid_z_indices = np.where(points[:, 2] >= -0.25)[0] 
                                         # 根据索引裁剪点云
                                         final_pcd = final_pcd.select_by_index(valid_z_indices)
 
@@ -1299,7 +1303,7 @@ def main():
                                         scene_mapper.update_window()
                                         
                                         print("   🪚 2. 正在识别桌面 (RANSAC)...")
-                                        plane_model, inliers = cleaned_pcd.segment_plane(distance_threshold=0.015, ransac_n=3, num_iterations=1000)
+                                        plane_model, inliers = cleaned_pcd.segment_plane(distance_threshold=0.01, ransac_n=3, num_iterations=1000)
                                         objects_pcd = cleaned_pcd.select_by_index(inliers, invert=True)
 
                                         # ==========================================
@@ -1311,13 +1315,33 @@ def main():
                                         # ==========================================
                                         
                                         print("   📦 3. 正在聚类并【彻底删除噪点】(DBSCAN)...")
-                                        labels = np.array(objects_pcd.cluster_dbscan(eps=0.03, min_points=50))
+                                        labels = np.array(objects_pcd.cluster_dbscan(eps=0.03, min_points=30))
                                         
                                         # 提取纯净盒子 (剔除 -1 噪点)
                                         valid_mask = labels >= 0  
                                         clean_objects_pcd = objects_pcd.select_by_index(np.where(valid_mask)[0])
                                         clean_labels = labels[valid_mask]
                                         
+                                        # ==========================================
+                                        # 🎨 核心新增：给不同物体上色并在窗口中单独显示它们！
+                                        # ==========================================
+                                        import matplotlib.pyplot as plt # 确保顶部或这里导入了 matplotlib
+                                        
+                                        max_label = clean_labels.max() if len(clean_labels) > 0 else -1
+                                        if max_label >= 0:
+                                            # 使用 tab20 调色板生成高对比度颜色
+                                            cmap = plt.get_cmap("tab20")
+                                            # 根据 label 计算颜色
+                                            colors = cmap(clean_labels / (max_label if max_label > 0 else 1))[:, :3]
+                                            clean_objects_pcd.colors = o3d.utility.Vector3dVector(colors)
+                                            
+                                            # 为了让你看个清楚，我们把 Open3D 窗口强制替换成【只显示彩色的盒子】！
+                                            # (不影响底层 global_pcd 的数据，只改变视觉显示)
+                                            scene_mapper.display_pcd.points = clean_objects_pcd.points
+                                            scene_mapper.display_pcd.colors = clean_objects_pcd.colors
+                                            scene_mapper.update_window()
+                                        # ==========================================
+
                                         # 🌟 关键 2：把纯净的盒子单独存进一个变量里，当做“磁铁”
                                         scene_mapper.objects_pcd = clean_objects_pcd
                                         scene_mapper.object_labels = clean_labels
@@ -1400,8 +1424,8 @@ def main():
                                             distance_to_box = np.sqrt(sq_dist[0])
                                             
                                             # 如果你看的地方方圆 20 厘米内根本没有盒子，说明你在看空桌子，放弃抓取
-                                            if distance_to_box > 0.20:
-                                                print(f"\n ⚠️ 视线落点周围没有盒子，请看向盒子！")
+                                            if distance_to_box > 0.3:
+                                                print(f"\n ⚠️ 视线落点周围没有盒子，请看向盒子！ distance to box : {np.round(distance_to_box, 3)}")
                                                 fixation_point = None
                                                 fixation_start_time = time.time()
                                                 continue
@@ -1632,7 +1656,7 @@ def main():
                                     full_visual_path.append(pt)
                                 
                                 # 把这整条完整的路径发给 HoloLens
-                                self.send_path_to_hololens(conn, full_visual_path, T_M)
+                                send_path_to_hololens(conn, full_visual_path, T_M)
                                 last_ray_print_time = time.time()
 
                             # =========================================================
@@ -1653,9 +1677,9 @@ def main():
                             # =========================================================
                             # 🤝 3. 到达与放手检测
                             # =========================================================
-                            user_reaching = check_reach_intent(skeleton_coord_camera) 
+                            #user_reaching = check_reach_intent(skeleton_coord_camera) 
                             
-                            if dist_to_target < 0.05 or user_reaching:
+                            if dist_to_target < 0.05:
                                 print("🤝 [HRI] 递送完成，检测到用户接管！")
                                 robot.stop_servoing() # 停止实时伺服
                                 time.sleep(0.5)       # 稍微停顿，建立心理安全感
@@ -1663,7 +1687,7 @@ def main():
                                 
                                 # 清除 HoloLens 里的线条 (发个空数组过去)
                                 if T_M is not None:
-                                    self.send_path_to_hololens(conn, [], T_M)
+                                    send_path_to_hololens(conn, [], T_M)
                                     
                                 current_hri_state = STATE_IDLE
                                 hri_start_time = 0.0
