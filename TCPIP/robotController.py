@@ -174,6 +174,34 @@ class RobotController:
                 
                 self.path_queue.task_done()
                 should_publish = True
+
+            # --- 🌟 优先级 2：全新 3D 伺服递送模式 (追击手部) ---
+            elif self.is_servoing and self.servo_target_p is not None and self.current_cmd_p is not None:
+                # 1. 计算误差向量 (目标点 - 当前指令点)
+                err_vec = self.servo_target_p - self.current_cmd_p
+                
+                # 2. 计算目标速度 (P 控制)
+                target_vel = self.Kp_servo * err_vec
+                
+                # 3. 速度限幅 (防止手动得太快，机械臂猛冲)
+                speed = np.linalg.norm(target_vel)
+                if speed > self.max_servo_vel:
+                    target_vel = target_vel * (self.max_servo_vel / speed)
+                
+                # 4. 积分得到下一帧的平滑位置
+                self.current_cmd_p += target_vel * dt
+                
+                # 5. 填装发布信息 (注意：姿态死死锁定为 start_servoing 时的姿态！)
+                msg.pose.position.x = self.current_cmd_p[0]
+                msg.pose.position.y = self.current_cmd_p[1]
+                msg.pose.position.z = self.current_cmd_p[2]
+                
+                msg.pose.orientation.x = self.servo_target_r[0]
+                msg.pose.orientation.y = self.servo_target_r[1]
+                msg.pose.orientation.z = self.servo_target_r[2]
+                msg.pose.orientation.w = self.servo_target_r[3]
+                
+                should_publish = True
             
                 # --- 优先级 2：炮台视觉伺服模式 (仅绕基座 Z 轴旋转) ---
             elif self.is_tracking and self.track_start_p is not None:
