@@ -53,6 +53,18 @@ class RobotController:
         self.current_yaw_vel = 0.0 # 当前平滑角速度
         self.max_yaw_accel = 0.4  # 最大角加速度 0.4 rad/s^2 (极致平滑起步)
 
+        # ====================================================
+        # 🛸【新增】3D 全向视觉伺服专用变量 (递送物品用)
+        # ====================================================
+        self.is_servoing = False
+        self.servo_target_p = None    # 3D 目标坐标
+        self.servo_target_r = None    # 锁定的姿态 (递送过程中姿态不能变)
+        
+        self.current_cmd_p = None     # 内部平滑指令缓存
+        
+        self.Kp_servo = 2.0           # 3D 追踪的比例系数 (Kp)
+        self.max_servo_vel = 0.1      # 最大直线追击速度: 0.1 m/s (10cm/s，非常安全)
+
         self.worker_thread = threading.Thread(target=self._tape_player_executor)
         self.worker_thread.setDaemon(True)
         self.worker_thread.start()
@@ -300,3 +312,34 @@ class RobotController:
             # 脱机调试时的假动作
             time.sleep(1.0) 
             print("   ✅ [模拟] 夹爪已抓紧。")
+
+    def start_servoing(self):
+        """启动 3D 平滑递送伺服模式"""
+        print("⏳ [Robot] 正在启动 3D 递送伺服模式...")
+        p, r = self.get_current_pose()
+        if p is not None:
+            # 锁定当前坐标和姿态作为起点
+            self.servo_target_p = p.copy()
+            self.servo_target_r = r.copy() 
+            self.current_cmd_p = p.copy()  # 初始化内部平滑指令
+            
+            with self.path_queue.mutex:
+                self.path_queue.queue.clear() # 清空所有旧路径
+            
+            self.is_servoing = True
+            print("🛸 [Robot] 3D 伺服递送模式已启动！(XYZ全向平移)")
+        else:
+            print("❌ [Robot] 获取起始位姿失败，无法启动伺服！")
+
+    def stop_servoing(self):
+        """停止 3D 伺服模式"""
+        self.is_servoing = False
+        print("🛑 [Robot] 3D 伺服递送已停止")
+
+    def update_servo_target(self, target_pos):
+        """
+        更新 3D 伺服的目标点 (绝对物理坐标)
+        :param target_pos: 机器人坐标系下的目标 [X, Y, Z]
+        """
+        if self.is_servoing and target_pos is not None:
+            self.servo_target_p = np.array(target_pos)

@@ -1629,6 +1629,11 @@ def main():
                                     # 这里可以保持在状态 6 循环，直到看到人为止
                 
                 elif current_hri_state == STATE_TRACKING_AND_PASS:
+                # 刚进入状态，开启伺服
+                    if hri_start_time == 0.0:
+                        robot.start_servoing()
+                        hri_start_time = time.time()
+                    
                     if skeleton_coord_camera is not None and len(skeleton_coord_camera) > 10:
                         hand_cam = np.array(skeleton_coord_camera[10])
                         
@@ -1639,8 +1644,12 @@ def main():
                             # 真实终点 (手上方的安全位置)
                             final_target_pos = r_hand_pos + np.array([0, 0, 0.15]) 
                             
-                            vec_to_target = final_target_pos - np.array(ee_pos)
-                            dist_to_target = np.linalg.norm(vec_to_target)
+                            # =========================================================
+                            # 🦾 控制层：直接把最终目标丢给伺服函数，什么都不用管！
+                            # 底层的积分控制器会自动把它变得平滑，并限制最大速度。
+                            # =========================================================
+                            if robot is not None:
+                                robot.update_servo_target(final_target_pos)
                             
                             # =========================================================
                             # 🌟 1. 视觉层：规划完整路径并发送给 HoloLens
@@ -1660,28 +1669,12 @@ def main():
                                 last_ray_print_time = time.time()
 
                             # =========================================================
-                            # 🦾 2. 控制层：只取眼前 5cm 的路点给底层 PID
-                            # =========================================================
-                            STEP_SIZE = 0.05
-                            if dist_to_target > STEP_SIZE:
-                                direction = vec_to_target / dist_to_target
-                                next_waypoint = np.array(ee_pos) + direction * STEP_SIZE
-                            else:
-                                next_waypoint = final_target_pos
-                                
-                            error_vec = next_waypoint - np.array(ee_pos)
-                            
-                            if robot is not None:
-                                robot.update_tracking_error(error_vec[0], error_vec[1], error_vec[2])
-
-                            # =========================================================
                             # 🤝 3. 到达与放手检测
                             # =========================================================
                             #user_reaching = check_reach_intent(skeleton_coord_camera) 
                             
                             if dist_to_target < 0.05:
                                 print("🤝 [HRI] 递送完成，检测到用户接管！")
-                                robot.stop_servoing() # 停止实时伺服
                                 time.sleep(0.5)       # 稍微停顿，建立心理安全感
                                 robot.open_gripper(width=0.08) 
                                 
