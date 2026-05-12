@@ -117,20 +117,37 @@ class RobotController:
         self._resample_path(path_list, start_p, start_r)
 
     def _resample_path(self, path_list, start_p, start_r):
-        """将离散点转换为时间连续的帧流"""
-        first_target = path_list[0]
+        """将离散点转换为时间连续的帧流 (修复了原地旋转导致的超速Bug)"""
         pts = [start_p] + [np.array(pt['pos']) for pt in path_list]
         rots = [start_r] + [np.array(pt['rot']) for pt in path_list]
 
-        # 计算总里程
+        # 1. 计算 XYZ 总直线里程
         cum_dist = [0.0]
         for i in range(1, len(pts)):
             cum_dist.append(cum_dist[-1] + np.linalg.norm(pts[i] - pts[i-1]))
-        
         total_dist = cum_dist[-1]
-        if total_dist < 0.001: return
 
-        total_time = total_dist / self.target_speed
+        # 2. 🌟 核心修复：计算四元数的总旋转角度 (弧度)
+        # 取终点和起点的四元数计算夹角
+        end_r = rots[-1]
+        dot_product = np.clip(np.dot(start_r, end_r), -1.0, 1.0)
+        # 两个四元数的夹角公式：theta = 2 * acos(|q1·q2|)
+        total_angle = 2.0 * math.acos(abs(dot_product))
+
+        # 3. 分别计算平移和旋转需要的时间
+        # 设定的平移速度 self.target_speed (如 0.05 m/s)
+        linear_time = total_dist / (self.target_speed + 1e-6) 
+        
+        # 设定一个安全的最大角速度，比如 0.2 rad/s (约 11度/秒)
+        max_angular_speed = 0.5 
+        angular_time = total_angle / max_angular_speed
+
+        # 🌟 最终时间取两者的最大值！(如果距离很短但要大转身，就多给点时间)
+        total_time = max(linear_time, angular_time)
+        
+        # 兜底：哪怕完全不动，也给 0.1 秒的缓冲，防止除以 0
+        total_time = max(total_time, 0.1) 
+
         total_steps = int(total_time * self.rate_hz)
 
         for i in range(1, total_steps + 1):
@@ -144,11 +161,13 @@ class RobotController:
             
             ratio = (target_d - cum_dist[idx-1]) / (cum_dist[idx] - cum_dist[idx-1] + 1e-9)
             curr_p = pts[idx-1] + (pts[idx] - pts[idx-1]) * ratio
+            
+            # 这里对姿态也应用 S 曲线平滑 (原代码 ratio 直接用在线性上没问题，但用在四元数上也要 S 曲线更稳)
             curr_r = quaternion_slerp(rots[idx-1], rots[idx], ratio)
             
             self.path_queue.put((curr_p, curr_r))
         
-        print(f"🚀 [Path] 采样完成，共 {self.path_queue.qsize()} 帧")
+        print(f"🚀 [Path] 采样完成，平移: {total_dist*100:.1f}cm, 旋转: {math.degrees(total_angle):.1f}° -> 耗时 {total_time:.2f} 秒")
 
     def _tape_player_executor(self):
         rate = rospy.Rate(self.rate_hz)

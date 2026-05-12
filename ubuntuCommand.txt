@@ -7,3 +7,5 @@ roslaunch franka_control cartesian_test.launch
 roslaunch franka_example_controllers cartesian_impedance_example_controller.launch robot_ip:=172.16.0.2 load_gripper:=false
 
 roslaunch franka_gripper franka_gripper.launch robot_ip:=172.16.0.2
+
+rosservice call /franka_control/set_force_torque_collision_behavior "{lower_torque_thresholds_nominal: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0], upper_torque_thresholds_nominal: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0], lower_force_thresholds_nominal: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0], upper_force_thresholds_nominal: [100.0, 100.0, 100.0, 100.0, 100.0, 100.0]}"

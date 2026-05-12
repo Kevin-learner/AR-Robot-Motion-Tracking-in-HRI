@@ -1090,18 +1090,18 @@ def main():
                 if current_hri_state == STATE_IDLE:
                     if robot is None:
                         robot = RobotController()
-                    # print("\n" + "="*50)
-                    # print("🤖 [HRI] 收到指令，启动人机交互流程！")
-                    # current_hri_state = STATE_INIT # 切入状态 0
-                    # print("="*50 + "\n")
-
                     print("\n" + "="*50)
-                    print("🤖 [HRI] 测试模式：跳过跟踪，直接进入状态 6 (Looking for user)！")
-                    
-                    current_hri_state = STATE_LOOKING_FOR_USER  # 🌟 直接空降状态 3！
-                    hri_start_time = 0.0                    # 确保重置计时器
-                    
+                    print("🤖 [HRI] 收到指令，启动人机交互流程！")
+                    current_hri_state = STATE_INIT # 切入状态 0
                     print("="*50 + "\n")
+
+                    # print("\n" + "="*50)
+                    # print("🤖 [HRI] 测试模式：跳过跟踪，直接进入状态 6 (Looking for user)！")
+                    
+                    # current_hri_state = STATE_LOOKING_FOR_USER  # 🌟 直接空降状态 3！
+                    # hri_start_time = 0.0                    # 确保重置计时器
+                    
+                    # print("="*50 + "\n")
                 
                 # 0. 初始位姿状态：机械臂前往预设的初始位置，等待 5 秒让用户观察
                 elif current_hri_state == STATE_INIT:
@@ -1211,8 +1211,8 @@ def main():
                             current_hri_state = STATE_SCAN_OBJECTS
                             hri_start_time = 0.0
 
-                        
-      # 状态 3：全自动直线巡航建图 (闭环距离控制版)
+                # -----------------------------------
+                # 状态 3：全自动直线巡航建图 (修复逻辑冲突版)
                 # -----------------------------------
                 elif current_hri_state == STATE_SCAN_OBJECTS:
                     
@@ -1221,36 +1221,32 @@ def main():
                         scene_mapper.clear()  
                         scan_current_step = 0 
                         
+                        # 发送第一个点
                         if robot is not None:
                             robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
                         
                         hri_start_time = time.time()
-                        last_capture_time = 0.0 # 🌟 魔法变量：0.0 表示“正在移动”，>0 表示“已到达，正在防抖计时”
+                        last_capture_time = 0.0 
                         
                     else:
-                        # 保持 3D 窗口实时刷新
                         scene_mapper.update_window()
+                        # 获取机器人是否空闲
+                        is_robot_idle = robot.path_queue.empty() if robot is not None else True
                         
                         ee_pos, ee_quat = robot_listener.get_current_pose()
                         
                         if ee_pos is not None:
-                            # ==========================================
-                            # 🎯 核心逻辑：计算真实物理距离
-                            # ==========================================
                             target_pos = scan_waypoints[scan_current_step][0:3]
-                            # 计算当前末端位置与目标位置的直线距离 (欧氏距离)
                             dist = np.linalg.norm(np.array(ee_pos) - np.array(target_pos))
                             
-                            # 【阶段 A】：如果还在路上
+                            # 【修改后的核心逻辑】
+                            # 只有当机械臂物理上到位 (dist < 0.02) 且 指令队列已排空 (is_robot_idle) 
                             if last_capture_time == 0.0:
-                                # 如果距离小于 0.02 米 (2 厘米)，说明抵达目标！
-                                if dist < 0.02:
+                                if dist < 0.02 and is_robot_idle: # 🌟 增加 idle 判断，防止指令冲突
                                     print(f"📍 已到达节点 {scan_current_step + 1}！停顿 0.8 秒防抖...")
-                                    last_capture_time = time.time() # 触发防抖计时器
-                            
-                            # 【阶段 B】：已经到达，正在防抖并拍照
+                                    last_capture_time = time.time()
                             else:
-                                if time.time() - last_capture_time > 0.8: # 等待 0.8 秒画面稳定
+                                if time.time() - last_capture_time > 0.5: # 等待 0.8 秒画面稳定
                                     print(f"📸 正在获取第 {scan_current_step + 1}/{SCAN_STEPS} 个视角的点云...")
                                     
                                     current_point_cloud = BodyPointCloud_dual.global_latest_verts
@@ -1552,12 +1548,12 @@ def main():
                         # 阶段 3：到达底部，闭合夹爪
                         # -----------------------------------
                         # 修改条件：下探的动作必须完全走完，才允许闭合夹爪！
-                        elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 1.0 and is_robot_idle:
+                        elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 1.5 and is_robot_idle:
                             print("   -> ✊ 阶段 3：接触目标，正在闭合夹爪...")
                             
                             # 🌟 抓紧盒子！
                             if robot is not None:
-                                robot.close_gripper(force=30.0) # 施加 30N 的抓取力
+                                robot.close_gripper(force=15.0, speed=0.05) # 施加 30N 的抓取力
                             
                             scene_mapper.grasp_step = 3
                             hri_start_time = time.time()
@@ -1584,7 +1580,7 @@ def main():
                             hri_start_time = 0.0
 
                 # -----------------------------------
-                # 状态 6：寻找用户 (抬头重定位)
+                # 状态 6：寻找用户并等待伸手触发
                 # -----------------------------------
                 elif current_hri_state == STATE_LOOKING_FOR_USER:
                     
@@ -1597,7 +1593,7 @@ def main():
                             robot.move_to(LOOK_USER_POSE, speed=0.05)
                         
                         hri_start_time = time.time()
-                        # 清空之前的意图历史，防止误触发
+                        # ⚠️ 切入状态前清空意图历史队列，准备重新记录
                         intent_history.clear() 
 
                     else:
@@ -1607,31 +1603,47 @@ def main():
                         # 如果已经抬头到位，开始利用视觉检测用户
                         if is_robot_idle and (time.time() - hri_start_time > 2.0):
                             
-                            # 核心：判断是否检测到人体骨架
+                            # 判断是否检测到人体骨架
                             if skeleton_coord_camera is not None and len(skeleton_coord_camera) > 10:
-                                # 检查是否有有效的人体中心点
                                 l_shoulder = np.array(skeleton_coord_camera[5])
-                                r_shoulder = np.array(skeleton_coord_camera[6])
                                 
                                 if np.linalg.norm(l_shoulder) > 0.1:
-                                    print("🎯 [HRI] 已重新锁定用户！准备进入递送模式...")
                                     
-                                    # 开启追踪模式
-                                    if robot is not None:
-                                        robot.start_tracking()
+                                    # =========================================================
+                                    # 🌟 [新增] 用户伸手 Trigger 防抖逻辑
+                                    # =========================================================
+                                    current_intent = check_reach_intent(skeleton_coord_camera)
+                                    intent_history.append(current_intent)
+                                    
+                                    # 只有当队列填满了（时间窗口满了），才开始计算比例
+                                    if len(intent_history) == intent_history.maxlen:
+                                        true_count = sum(intent_history)
+                                        true_ratio = true_count / len(intent_history)
                                         
-                                    current_hri_state = STATE_TRACKING_AND_PASS
-                                    hri_start_time = 0.0
+                                        # 如果超过 80% 的帧都判定为伸手，则确认触发！
+                                        if true_ratio >= 0.8:
+                                            print(f"🎯 [HRI] 确认用户已伸手接收 (置信度: {true_ratio*100:.1f}%)！准备进入递送模式...")
+                                            
+                                            intent_history.clear() # 清空历史，防止干扰后续状态
+                                            current_hri_state = STATE_TRACKING_AND_PASS
+                                            hri_start_time = 0.0
+                                        else:
+                                            # 为了防止刷屏，这里可以选择不打印，或者限制打印频率
+                                            pass
                             else:
-                                # 如果还没看到人，可以加一个简单的超时处理或者循环等待
+                                # 如果还没看到人，加一个简单的超时处理
                                 if time.time() - hri_start_time > 15.0:
-                                    print("⚠️ [HRI] 寻找用户超时，请出现在相机视野内！")
-                                    # 这里可以保持在状态 6 循环，直到看到人为止
+                                    print("⚠️ [HRI] 等待用户超时，请出现在相机视野内并伸手！")
+                                    hri_start_time = time.time() # 重置超时计时器，继续等
                 
+                # -----------------------------------
+                # 状态 7：平滑追踪递送
+                # -----------------------------------
                 elif current_hri_state == STATE_TRACKING_AND_PASS:
-                # 刚进入状态，开启伺服
+                    # 刚进入状态，开启伺服
                     if hri_start_time == 0.0:
-                        robot.start_servoing()
+                        if robot is not None:
+                            robot.start_servoing()
                         hri_start_time = time.time()
                     
                     if skeleton_coord_camera is not None and len(skeleton_coord_camera) > 10:
@@ -1645,8 +1657,13 @@ def main():
                             final_target_pos = r_hand_pos + np.array([0, 0, 0.15]) 
                             
                             # =========================================================
+                            # 🌟 [修复] 补充缺失的距离和向量计算！
+                            # =========================================================
+                            vec_to_target = final_target_pos - np.array(ee_pos)
+                            dist_to_target = np.linalg.norm(vec_to_target)
+                            
+                            # =========================================================
                             # 🦾 控制层：直接把最终目标丢给伺服函数，什么都不用管！
-                            # 底层的积分控制器会自动把它变得平滑，并限制最大速度。
                             # =========================================================
                             if robot is not None:
                                 robot.update_servo_target(final_target_pos)
@@ -1655,28 +1672,32 @@ def main():
                             # 🌟 1. 视觉层：规划完整路径并发送给 HoloLens
                             # =========================================================
                             if T_M is not None and (time.time() - last_ray_print_time > 0.1):
-                                # 生成一条包含 10 个点的完整路径 (你可以换成贝塞尔曲线让它带有弧度)
                                 full_visual_path = []
                                 num_visual_points = 10
                                 for i in range(num_visual_points + 1):
                                     ratio = i / float(num_visual_points)
-                                    # 如果你想加抛物线弧度，可以像你之前的 SCAN_ARC_HEIGHT 那样在这里给 Z 轴加上偏移
                                     pt = np.array(ee_pos) + ratio * vec_to_target
                                     full_visual_path.append(pt)
                                 
-                                # 把这整条完整的路径发给 HoloLens
                                 send_path_to_hololens(conn, full_visual_path, T_M)
                                 last_ray_print_time = time.time()
 
                             # =========================================================
                             # 🤝 3. 到达与放手检测
                             # =========================================================
-                            #user_reaching = check_reach_intent(skeleton_coord_camera) 
+                            # user_reaching = check_reach_intent(skeleton_coord_camera) 
                             
                             if dist_to_target < 0.05:
                                 print("🤝 [HRI] 递送完成，检测到用户接管！")
+                                
+                                # [修复] 放手前必须先停止伺服追击，否则机械臂会乱抖
+                                if robot is not None:
+                                    robot.stop_servoing() 
+                                    
                                 time.sleep(0.5)       # 稍微停顿，建立心理安全感
-                                robot.open_gripper(width=0.08) 
+                                
+                                if robot is not None:
+                                    robot.open_gripper(width=0.08) 
                                 
                                 # 清除 HoloLens 里的线条 (发个空数组过去)
                                 if T_M is not None:
