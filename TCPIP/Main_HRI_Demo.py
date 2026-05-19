@@ -454,6 +454,8 @@ def main():
     global_ray_origin = None 
     global_ray_hit = None
     current_point_cloud = None
+
+    global_holo_hand_pos = None
     
     # ====== Multipointcloud test ======
     # 这里使用的是 [x, y, z, qx, qy, qz, qw] 或关节角，只要符合你的 robot.move_to 格式即可
@@ -534,7 +536,7 @@ def main():
                     print(f"连接异常: {e}")
                     break
                 
-                if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f', 'e', 'O', 'P']:
+                if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f', 'e', 'h', 'O', 'P']:
                     #print(f"\n[TCP] Received Header: '{header}'")
                     conn.setblocking(True)
                 # ===============================================
@@ -935,6 +937,22 @@ def main():
                             #print(f"👁️ [TCP] 眼动坐标已更新...")
                         else:
                             print("   ⚠️ T_M 矩阵为空，无法转换眼动坐标！")
+
+                    # ===============================================
+                    # 🌟 CASE 'h': 接收原生手掌跟踪坐标 (Header 'h')
+                    # ===============================================
+                    elif header == 'h':
+                        pos_bytes = recv_exact(conn, 12)
+                        if pos_bytes:
+                            hx, hy, hz = struct.unpack('<fff', pos_bytes)
+                            u_hand_pos = np.array([hx, hy, hz])
+                            
+                            if T_M is not None:
+                                # 转换为机器人坐标并存入全局变量
+                                global_holo_hand_pos = rut.unity2robot_transform(u_hand_pos, T_M)
+                            else:
+                                print("  ⚠️ T_M 矩阵为空，无法转换手掌坐标！")
+
                     elif header == 'O': 
                         is_HRI_Demo = True
                         print("Demo模式已开")
@@ -1637,7 +1655,7 @@ def main():
                                     hri_start_time = time.time() # 重置超时计时器，继续等
                 
                 # -----------------------------------
-                # 状态 7：平滑追踪递送
+                # 状态 7：平滑追踪递送 (基于 HoloLens 原生坐标)
                 # -----------------------------------
                 elif current_hri_state == STATE_TRACKING_AND_PASS:
                     # 刚进入状态，开启伺服
@@ -1645,31 +1663,27 @@ def main():
                         if robot is not None:
                             robot.start_servoing()
                         hri_start_time = time.time()
+                        print("🚀 [HRI] 正在向您的手掌递送物品...")
                     
-                    if skeleton_coord_camera is not None and len(skeleton_coord_camera) > 10:
-                        hand_cam = np.array(skeleton_coord_camera[10])
+                    # 🌟 核心：使用 HoloLens 传来的原生手掌坐标
+                    if global_holo_hand_pos is not None:
+                        ee_pos, _ = robot_listener.get_current_pose()
                         
-                        if np.linalg.norm(hand_cam) > 0.1:
-                            ee_pos, ee_quat = robot_listener.get_current_pose()
-                            r_hand_pos = camera2unity.points_camera_to_robot([hand_cam], ee_pos, ee_quat, EE_T_C)[0]
+                        if ee_pos is not None:
+                            # 真实终点 (手上方的安全位置, Z轴抬高15cm, 向用户方向延伸一点)
+                            final_target_pos = global_holo_hand_pos + np.array([0, 0, 0.15]) 
                             
-                            # 真实终点 (手上方的安全位置)
-                            final_target_pos = r_hand_pos + np.array([0, 0, 0.15]) 
-                            
-                            # =========================================================
-                            # 🌟 [修复] 补充缺失的距离和向量计算！
-                            # =========================================================
                             vec_to_target = final_target_pos - np.array(ee_pos)
                             dist_to_target = np.linalg.norm(vec_to_target)
                             
                             # =========================================================
-                            # 🦾 控制层：直接把最终目标丢给伺服函数，什么都不用管！
+                            # 🦾 控制层：直接把最终目标丢给伺服函数
                             # =========================================================
                             if robot is not None:
                                 robot.update_servo_target(final_target_pos)
                             
                             # =========================================================
-                            # 🌟 1. 视觉层：规划完整路径并发送给 HoloLens
+                            # 🌟 视觉层：规划完整路径并发送给 HoloLens
                             # =========================================================
                             if T_M is not None and (time.time() - last_ray_print_time > 0.1):
                                 full_visual_path = []
@@ -1683,28 +1697,30 @@ def main():
                                 last_ray_print_time = time.time()
 
                             # =========================================================
-                            # 🤝 3. 到达与放手检测
+                            # 🤝 到达与放手检测
                             # =========================================================
-                            # user_reaching = check_reach_intent(skeleton_coord_camera) 
-                            
+                            # 到达 5cm 内，自动放手
                             if dist_to_target < 0.05:
-                                print("🤝 [HRI] 递送完成，检测到用户接管！")
+                                print("🤝 [HRI] 递送完成，请接好！")
                                 
-                                # [修复] 放手前必须先停止伺服追击，否则机械臂会乱抖
+                                # 放手前必须先停止伺服追击
                                 if robot is not None:
                                     robot.stop_servoing() 
                                     
-                                time.sleep(0.5)       # 稍微停顿，建立心理安全感
+                                time.sleep(0.5) # 稍微停顿，建立心理安全感
                                 
                                 if robot is not None:
                                     robot.open_gripper(width=0.08) 
                                 
-                                # 清除 HoloLens 里的线条 (发个空数组过去)
+                                # 清除 HoloLens 里的预测线条
                                 if T_M is not None:
                                     send_path_to_hololens(conn, [], T_M)
                                     
+                                # 彻底完成，重置状态与变量
                                 current_hri_state = STATE_IDLE
                                 hri_start_time = 0.0
+                                global_holo_hand_pos = None
+
     except Exception as e:
         print(f"[TCP] Server Error: {e}")
 
