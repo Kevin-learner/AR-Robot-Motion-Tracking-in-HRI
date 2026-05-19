@@ -462,7 +462,7 @@ def main():
 
     SCAN_START_POSE = [0.5792, 0.2653, 0.5375, 0.91, -0.42, 0.04, -0.02]
     SCAN_END_POSE   = [0.5621, -0.1739, 0.5375, -0.92, 0.38, -0.04, -0.01] #[INFO] [1777634168.026776]: sent #149 UPDATED d=0.000223 xyz=(0.5621, -0.1739, 0.5610) Euler[Deg]=(Rx:-179.5, Ry:-4.6, Rz:-45.0) q=(-0.92, 0.38, -0.04, -0.01)
-    SCAN_STEPS = 8  # 直线上拍 4 张照片（起点、2个中间点、终点）
+    SCAN_STEPS = 6  # 直线上拍 4 张照片（起点、2个中间点、终点）
 
     SCAN_ARC_HEIGHT = 0.04
 
@@ -499,7 +499,8 @@ def main():
 
     LOOK_USER_POSE = [0.6097, 0.0584, 0.5640, 0.69, -0.26, 0.61, -0.28]
     # [INFO] [1778077176.377578]: sent #8199 UPDATED d=0.000063 xyz=(0.6097, 0.0584, 0.5640) Euler[Deg]=(Rx:-98.2, Ry:-44.1, Rz:-80.3) q=(0.69, -0.26, 0.61, -0.28)
-    
+    READY_FOR_PASSING_POSE = [0.3319, -0.0112, 0.5835, -0.92, 0.39, -0.04, 0.02]
+    #[INFO] [1779192781.952631]: sent #567 UPDATED d=0.000005 xyz=(0.3319, -0.0112, 0.5835) Euler[Deg]=(Rx:-176.0, Ry:-3.7, Rz:-46.4) q=(-0.92, 0.39, -0.04, 0.02)
 
     # ===============================
 
@@ -1114,9 +1115,9 @@ def main():
                     print("="*50 + "\n")
 
                     # print("\n" + "="*50)
-                    # print("🤖 [HRI] 测试模式：跳过跟踪，直接进入状态 6 (Looking for user)！")
+                    # print("🤖 [HRI] 测试模式：跳过跟踪，直接进入状态 7 (Looking for user)！")
                     
-                    # current_hri_state = STATE_LOOKING_FOR_USER  # 🌟 直接空降状态 3！
+                    # current_hri_state = STATE_TRACKING_AND_PASS  # 🌟 直接空降状态 7！
                     # hri_start_time = 0.0                    # 确保重置计时器
                     
                     # print("="*50 + "\n")
@@ -1229,8 +1230,8 @@ def main():
                             current_hri_state = STATE_SCAN_OBJECTS
                             hri_start_time = 0.0
 
-                # -----------------------------------
-                # 状态 3：全自动直线巡航建图 (修复逻辑冲突版)
+# -----------------------------------
+                # 状态 3：全自动直线巡航建图 (彻底修复越界死锁版)
                 # -----------------------------------
                 elif current_hri_state == STATE_SCAN_OBJECTS:
                     
@@ -1239,7 +1240,6 @@ def main():
                         scene_mapper.clear()  
                         scan_current_step = 0 
                         
-                        # 发送第一个点
                         if robot is not None:
                             robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
                         
@@ -1248,124 +1248,121 @@ def main():
                         
                     else:
                         scene_mapper.update_window()
-                        # 获取机器人是否空闲
                         is_robot_idle = robot.path_queue.empty() if robot is not None else True
-                        
                         ee_pos, ee_quat = robot_listener.get_current_pose()
                         
                         if ee_pos is not None:
-                            target_pos = scan_waypoints[scan_current_step][0:3]
-                            dist = np.linalg.norm(np.array(ee_pos) - np.array(target_pos))
-                            
-                            # 【修改后的核心逻辑】
-                            # 只有当机械臂物理上到位 (dist < 0.02) 且 指令队列已排空 (is_robot_idle) 
-                            if last_capture_time == 0.0:
-                                if dist < 0.02 and is_robot_idle: # 🌟 增加 idle 判断，防止指令冲突
-                                    print(f"📍 已到达节点 {scan_current_step + 1}！停顿 0.8 秒防抖...")
-                                    last_capture_time = time.time()
-                            else:
-                                if time.time() - last_capture_time > 0.5: # 等待 0.8 秒画面稳定
-                                    print(f"📸 正在获取第 {scan_current_step + 1}/{SCAN_STEPS} 个视角的点云...")
-                                    
-                                    current_point_cloud = BodyPointCloud_dual.global_latest_verts
-                                    current_colors = BodyPointCloud_dual.global_latest_colors 
-                                    
-                                    if current_point_cloud is not None:
-                                        # ✂️ 空间裁剪 (保留桌面上方有效范围)
-                                        bbox_mask = (
-                                            (current_point_cloud[:, 2] > 0.1) & (current_point_cloud[:, 2] < 1.5) & 
-                                            (current_point_cloud[:, 0] > -0.8) & (current_point_cloud[:, 0] < 0.8)
-                                        )
-                                        p_crop = current_point_cloud[bbox_mask]
-                                        c_crop = current_colors[bbox_mask]
+                            # =========================================================
+                            # 🌟 核心修复：只有在扫描步数没走完时，才计算路点目标
+                            # =========================================================
+                            if scan_current_step < SCAN_STEPS:
+                                target_pos = scan_waypoints[scan_current_step][0:3]
+                                dist = np.linalg.norm(np.array(ee_pos) - np.array(target_pos))
+                                
+                                # 阶段 A：如果还在移动路上
+                                if last_capture_time == 0.0:
+                                    if dist < 0.02 and is_robot_idle: 
+                                        print(f"📍 已到达节点 {scan_current_step + 1}！停顿 0.8 秒防抖...")
+                                        last_capture_time = time.time()
+                                # 阶段 B：已经到达，防抖并拍照
+                                else:
+                                    if time.time() - last_capture_time > 0.5: 
+                                        print(f"📸 正在获取第 {scan_current_step + 1}/{SCAN_STEPS} 个视角的点云...")
+                                        
+                                        current_point_cloud = BodyPointCloud_dual.global_latest_verts
+                                        current_colors = BodyPointCloud_dual.global_latest_colors 
+                                        
+                                        if current_point_cloud is not None:
+                                            bbox_mask = (
+                                                (current_point_cloud[:, 2] > 0.1) & (current_point_cloud[:, 2] < 1.5) & 
+                                                (current_point_cloud[:, 0] > -0.8) & (current_point_cloud[:, 0] < 0.8)
+                                            )
+                                            p_crop = current_point_cloud[bbox_mask]
+                                            c_crop = current_colors[bbox_mask]
 
-                                        # 坐标转换并拼合
-                                        verts_robot_base = camera2unity.point_cloud_camera_to_robot(
-                                            p_crop, ee_pos, ee_quat, EE_T_C
-                                        )
-                                        scene_mapper.add_point_cloud(verts_robot_base, c_crop)
-                                        print(f"   ✅ 节点 {scan_current_step + 1} 拼合成功。")
-                                    else:
-                                        print(f"   ⚠️ 节点 {scan_current_step + 1} 数据获取失败，跳过。")
-                                        
-                                    # 准备前往下一个点
-                                    scan_current_step += 1
-                                    
-                                    if scan_current_step < SCAN_STEPS:
-                                        if robot is not None:
-                                            robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
-                                        last_capture_time = 0.0 # 🌟 切回“正在移动”状态
-                                    else:
-                                        print("\n🎉 [HRI] 全自动扫描任务完成！正在处理点云数据...")
-                                        
-                                        final_pcd = scene_mapper.global_pcd
-
-                                        print("   ✂️ 0. 正在进行 Z 轴高度直通滤波 (保留 Z >= -0.25)...")
-                                        points = np.asarray(final_pcd.points)
-                                        # 找到所有 Z 坐标大于等于 0 的点的索引
-                                        valid_z_indices = np.where(points[:, 2] >= -0.25)[0] 
-                                        # 根据索引裁剪点云
-                                        final_pcd = final_pcd.select_by_index(valid_z_indices)
-
-                                        print("   🧹 1. 正在执行统计学滤波降噪...")
-                                        cleaned_pcd, _ = final_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-                                        
-                                        # 🌟 关键 1：把包含桌子的完整地图留给 Open3D 显示，用来接住你的视线！
-                                        scene_mapper.global_pcd = cleaned_pcd
-                                        scene_mapper.display_pcd.points = cleaned_pcd.points
-                                        scene_mapper.display_pcd.colors = cleaned_pcd.colors
-                                        scene_mapper.update_window()
-                                        
-                                        print("   🪚 2. 正在识别桌面 (RANSAC)...")
-                                        plane_model, inliers = cleaned_pcd.segment_plane(distance_threshold=0.01, ransac_n=3, num_iterations=1000)
-                                        objects_pcd = cleaned_pcd.select_by_index(inliers, invert=True)
-
-                                        # ==========================================
-                                        # 提取并保存桌面的绝对 Z 高度
-                                        # ==========================================
-                                        table_points = np.asarray(cleaned_pcd.select_by_index(inliers).points)
-                                        scene_mapper.table_z = np.mean(table_points[:, 2]) 
-                                        print(f"   📏 测得桌面绝对物理高度: Z = {scene_mapper.table_z:.4f} 米")
-                                        # ==========================================
-                                        
-                                        print("   📦 3. 正在聚类并【彻底删除噪点】(DBSCAN)...")
-                                        labels = np.array(objects_pcd.cluster_dbscan(eps=0.03, min_points=30))
-                                        
-                                        # 提取纯净盒子 (剔除 -1 噪点)
-                                        valid_mask = labels >= 0  
-                                        clean_objects_pcd = objects_pcd.select_by_index(np.where(valid_mask)[0])
-                                        clean_labels = labels[valid_mask]
-                                        
-                                        # ==========================================
-                                        # 🎨 核心新增：给不同物体上色并在窗口中单独显示它们！
-                                        # ==========================================
-                                        import matplotlib.pyplot as plt # 确保顶部或这里导入了 matplotlib
-                                        
-                                        max_label = clean_labels.max() if len(clean_labels) > 0 else -1
-                                        if max_label >= 0:
-                                            # 使用 tab20 调色板生成高对比度颜色
-                                            cmap = plt.get_cmap("tab20")
-                                            # 根据 label 计算颜色
-                                            colors = cmap(clean_labels / (max_label if max_label > 0 else 1))[:, :3]
-                                            clean_objects_pcd.colors = o3d.utility.Vector3dVector(colors)
+                                            verts_robot_base = camera2unity.point_cloud_camera_to_robot(
+                                                p_crop, ee_pos, ee_quat, EE_T_C
+                                            )
+                                            scene_mapper.add_point_cloud(verts_robot_base, c_crop)
+                                            print(f"   ✅ 节点 {scan_current_step + 1} 拼合成功。")
+                                        else:
+                                            print(f"   ⚠️ 节点 {scan_current_step + 1} 数据获取失败，跳过。")
                                             
-                                            # 为了让你看个清楚，我们把 Open3D 窗口强制替换成【只显示彩色的盒子】！
-                                            # (不影响底层 global_pcd 的数据，只改变视觉显示)
-                                            scene_mapper.display_pcd.points = clean_objects_pcd.points
-                                            scene_mapper.display_pcd.colors = clean_objects_pcd.colors
-                                            scene_mapper.update_window()
-                                        # ==========================================
+                                        # 步数加 1
+                                        scan_current_step += 1
+                                        
+                                        # 如果还有下一个点，继续让机械臂走
+                                        if scan_current_step < SCAN_STEPS:
+                                            if robot is not None:
+                                                robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
+                                            last_capture_time = 0.0 
+                            
+                            # =========================================================
+                            # 🌟 核心修复：扫描步数全走完了，进入安全后处理与退回阶段
+                            # =========================================================
+                            else:
+                                # 子阶段 1：点云算法处理，并下发退回指令
+                                if getattr(scene_mapper, 'scan_post_process', 0) == 0:
+                                    print("\n🎉 [HRI] 全自动扫描任务完成！正在处理点云数据...")
+                                    
+                                    final_pcd = scene_mapper.global_pcd
+                                    print("   ✂️ 0. 正在进行 Z 轴高度直通滤波...")
+                                    points = np.asarray(final_pcd.points)
+                                    valid_z_indices = np.where(points[:, 2] >= -0.25)[0] 
+                                    final_pcd = final_pcd.select_by_index(valid_z_indices)
 
-                                        # 🌟 关键 2：把纯净的盒子单独存进一个变量里，当做“磁铁”
-                                        scene_mapper.objects_pcd = clean_objects_pcd
-                                        scene_mapper.object_labels = clean_labels
+                                    print("   🧹 1. 正在执行统计学滤波降噪...")
+                                    cleaned_pcd, _ = final_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+                                    
+                                    scene_mapper.global_pcd = cleaned_pcd
+                                    scene_mapper.display_pcd.points = cleaned_pcd.points
+                                    scene_mapper.display_pcd.colors = cleaned_pcd.colors
+                                    scene_mapper.update_window()
+                                    
+                                    print("   🪚 2. 正在识别桌面 (RANSAC)...")
+                                    plane_model, inliers = cleaned_pcd.segment_plane(distance_threshold=0.01, ransac_n=3, num_iterations=1000)
+                                    objects_pcd = cleaned_pcd.select_by_index(inliers, invert=True)
+
+                                    table_points = np.asarray(cleaned_pcd.select_by_index(inliers).points)
+                                    scene_mapper.table_z = np.mean(table_points[:, 2]) 
+                                    print(f"   📏 测得桌面绝对物理高度: Z = {scene_mapper.table_z:.4f} 米")
+                                    
+                                    print("   📦 3. 正在聚类并【彻底删除噪点】...")
+                                    labels = np.array(objects_pcd.cluster_dbscan(eps=0.03, min_points=30))
+                                    
+                                    valid_mask = labels >= 0  
+                                    clean_objects_pcd = objects_pcd.select_by_index(np.where(valid_mask)[0])
+                                    clean_labels = labels[valid_mask]
+                                    
+                                    import matplotlib.pyplot as plt 
+                                    max_label = clean_labels.max() if len(clean_labels) > 0 else -1
+                                    if max_label >= 0:
+                                        cmap = plt.get_cmap("tab20")
+                                        colors = cmap(clean_labels / (max_label if max_label > 0 else 1))[:, :3]
+                                        clean_objects_pcd.colors = o3d.utility.Vector3dVector(colors)
                                         
-                                        print(f"   ✅ 物品提取完毕！共发现 {clean_labels.max() + 1 if len(clean_labels)>0 else 0} 个纯净物体。")
+                                        scene_mapper.display_pcd.points = clean_objects_pcd.points
+                                        scene_mapper.display_pcd.colors = clean_objects_pcd.colors
+                                        scene_mapper.update_window()
+
+                                    scene_mapper.objects_pcd = clean_objects_pcd
+                                    scene_mapper.object_labels = clean_labels
+                                    print(f"   ✅ 物品提取完毕！共发现 {clean_labels.max() + 1 if len(clean_labels)>0 else 0} 个纯净物体。")
+                                    
+                                    print(f"   🤖 正在退回安全观测/递送准备位...")
+                                    if robot is not None:
+                                        robot.move_to(READY_FOR_PASSING_POSE, speed=0.05)
                                         
+                                    scene_mapper.scan_post_process = 1  
+                                    hri_start_time = time.time()
+                                    
+                                # 子阶段 2：安全等待机器人退回到位
+                                elif getattr(scene_mapper, 'scan_post_process', 0) == 1:
+                                    if is_robot_idle and (time.time() - hri_start_time > 1.0):
                                         print("\n👀 切换至状态 4: 请通过眼动凝视选择目标物体...")
                                         current_hri_state = STATE_GAZE_INTERSECTION
                                         hri_start_time = 0.0
-                            
+                                        scene_mapper.scan_post_process = 0 # 重置标记
                 # -----------------------------------
                 # 状态 4：全景眼动求交 + 纯净物品吸附
                 # -----------------------------------
@@ -1597,63 +1594,124 @@ def main():
                             current_hri_state = STATE_LOOKING_FOR_USER
                             hri_start_time = 0.0
 
+                # # -----------------------------------
+                # # 状态 6：寻找用户 -> 确认伸手 -> 翻转为递送姿势
+                # # -----------------------------------
+                # elif current_hri_state == STATE_LOOKING_FOR_USER:
+                    
+                #     if hri_start_time == 0.0:
+                #         print("\n" + "="*50)
+                #         print("🤖 [HRI] 状态 6: 抓取成功！正在抬头寻找用户...")
+                        
+                #         if robot is not None:
+                #             robot.move_to(LOOK_USER_POSE, speed=0.05)
+                        
+                #         hri_start_time = time.time()
+                #         intent_history.clear() 
+                #         # 🌟 新增：阶段标记，1 为等待伸手，2 为翻转姿态
+                #         scene_mapper.looking_step = 1 
+
+                #     else:
+                #         is_robot_idle = robot.path_queue.empty() if robot is not None else True
+                        
+                #         # -----------------------------------
+                #         # 阶段 1：等待机械臂抬头完毕，并用相机检测伸手意图
+                #         # -----------------------------------
+                #         if getattr(scene_mapper, 'looking_step', 1) == 1:
+                #             if is_robot_idle and (time.time() - hri_start_time > 2.0):
+                #                 if skeleton_coord_camera is not None and len(skeleton_coord_camera) > 10:
+                #                     l_shoulder = np.array(skeleton_coord_camera[5])
+                                    
+                #                     if np.linalg.norm(l_shoulder) > 0.1:
+                #                         current_intent = check_reach_intent(skeleton_coord_camera)
+                #                         intent_history.append(current_intent)
+                                        
+                #                         if len(intent_history) == intent_history.maxlen:
+                #                             true_ratio = sum(intent_history) / len(intent_history)
+                                            
+                #                             # 如果确认用户伸手
+                #                             if true_ratio >= 0.8:
+                #                                 print(f"🎯 [HRI] 确认用户已伸手！正在翻转夹爪至向下递送姿态...")
+                                                
+                #                                 # 🌟 触发移动到夹爪向下的准备姿态
+                #                                 if robot is not None:
+                #                                     robot.move_to(READY_FOR_PASSING_POSE, speed=0.05)
+                                                
+                #                                 intent_history.clear()
+                #                                 scene_mapper.looking_step = 2 # 切换到阶段 2
+                #                                 hri_start_time = time.time()  # 重置计时器
+                                                
+                #                 else:
+                #                     if time.time() - hri_start_time > 15.0:
+                #                         print("⚠️ [HRI] 等待用户超时，请出现在相机视野内并伸手！")
+                #                         hri_start_time = time.time()
+                                        
+                #         # -----------------------------------
+                #         # 阶段 2：等待机械臂翻转到递送准备姿势
+                #         # -----------------------------------
+                #         elif getattr(scene_mapper, 'looking_step', 1) == 2:
+                #             # 确保翻转动作已经走完，并且稍微给 1 秒冗余时间防抖
+                #             if is_robot_idle and (time.time() - hri_start_time > 1.0):
+                #                 print("✅ [HRI] 已到达向下递送姿态，切入动态追踪 (状态 7)！")
+                #                 current_hri_state = STATE_TRACKING_AND_PASS
+                #                 hri_start_time = 0.0
+                
+
                 # -----------------------------------
-                # 状态 6：寻找用户并等待伸手触发
+                # 状态 6：等待手掌进入工作空间 -> 翻转为递送姿势
                 # -----------------------------------
                 elif current_hri_state == STATE_LOOKING_FOR_USER:
                     
                     if hri_start_time == 0.0:
                         print("\n" + "="*50)
-                        print("🤖 [HRI] 状态 6: 抓取成功！正在抬头寻找用户...")
-                        
-                        if robot is not None:
-                            # 抬起头到预设观测位
-                            robot.move_to(LOOK_USER_POSE, speed=0.05)
+                        print("🤖 [HRI] 状态 6: 抓取成功！等待用户将手伸入工作空间...")
                         
                         hri_start_time = time.time()
-                        # ⚠️ 切入状态前清空意图历史队列，准备重新记录
-                        intent_history.clear() 
+                        scene_mapper.looking_step = 1 # 阶段1：等待手掌；阶段2：等待姿态翻转
 
                     else:
-                        # 检查机械臂是否动作完毕
                         is_robot_idle = robot.path_queue.empty() if robot is not None else True
                         
-                        # 如果已经抬头到位，开始利用视觉检测用户
-                        if is_robot_idle and (time.time() - hri_start_time > 2.0):
+                        # -----------------------------------
+                        # 阶段 1：静静等待有效的手掌坐标进入判定区
+                        # -----------------------------------
+                        if getattr(scene_mapper, 'looking_step', 1) == 1:
                             
-                            # 判断是否检测到人体骨架
-                            if skeleton_coord_camera is not None and len(skeleton_coord_camera) > 10:
-                                l_shoulder = np.array(skeleton_coord_camera[5])
+                            # 直接读取 HoloLens 发来的原生手掌坐标
+                            if global_holo_hand_pos is not None:
                                 
-                                if np.linalg.norm(l_shoulder) > 0.1:
+                                # 计算手掌距离机械臂基座 [0,0,0] 的直线距离
+                                dist_to_base = np.linalg.norm(global_holo_hand_pos)
+                                
+                                # 设定机械臂的安全工作空间半径 (例如 0.75 米)
+                                WORKSPACE_RADIUS = 1.0
+                                
+                                if dist_to_base < WORKSPACE_RADIUS:
+                                    print(f"🎯 [HRI] 检测到手掌已进入工作空间 (距离: {dist_to_base:.2f}m)！正在翻转夹爪至向下递送姿态...")
                                     
-                                    # =========================================================
-                                    # 🌟 [新增] 用户伸手 Trigger 防抖逻辑
-                                    # =========================================================
-                                    current_intent = check_reach_intent(skeleton_coord_camera)
-                                    intent_history.append(current_intent)
+                                    # 🌟 触发移动到夹爪向下的准备姿态
+                                    if robot is not None:
+                                        robot.move_to(READY_FOR_PASSING_POSE, speed=0.05)
                                     
-                                    # 只有当队列填满了（时间窗口满了），才开始计算比例
-                                    if len(intent_history) == intent_history.maxlen:
-                                        true_count = sum(intent_history)
-                                        true_ratio = true_count / len(intent_history)
-                                        
-                                        # 如果超过 80% 的帧都判定为伸手，则确认触发！
-                                        if true_ratio >= 0.8:
-                                            print(f"🎯 [HRI] 确认用户已伸手接收 (置信度: {true_ratio*100:.1f}%)！准备进入递送模式...")
-                                            
-                                            intent_history.clear() # 清空历史，防止干扰后续状态
-                                            current_hri_state = STATE_TRACKING_AND_PASS
-                                            hri_start_time = 0.0
-                                        else:
-                                            # 为了防止刷屏，这里可以选择不打印，或者限制打印频率
-                                            pass
+                                    scene_mapper.looking_step = 2 # 切换到阶段 2
+                                    hri_start_time = time.time()  # 重置计时器
+                                    
                             else:
-                                # 如果还没看到人，加一个简单的超时处理
-                                if time.time() - hri_start_time > 15.0:
-                                    print("⚠️ [HRI] 等待用户超时，请出现在相机视野内并伸手！")
-                                    hri_start_time = time.time() # 重置超时计时器，继续等
-                
+                                # 如果一直没收到坐标，每 10 秒提醒一次
+                                if time.time() - hri_start_time > 10.0:
+                                    print("⚠️ [HRI] 请在 HoloLens 中开启手掌追踪，并将手伸向机械臂...")
+                                    hri_start_time = time.time()
+                                        
+                        # -----------------------------------
+                        # 阶段 2：等待机械臂翻转到递送准备姿势
+                        # -----------------------------------
+                        elif getattr(scene_mapper, 'looking_step', 1) == 2:
+                            # 确保翻转动作已经走完，并且稍微给 1 秒冗余时间防抖
+                            if is_robot_idle and (time.time() - hri_start_time > 1.0):
+                                print("✅ [HRI] 已到达向下递送姿态，切入动态追踪 (状态 7)！")
+                                current_hri_state = STATE_TRACKING_AND_PASS
+                                hri_start_time = 0.0
+
                 # -----------------------------------
                 # 状态 7：平滑追踪递送 (基于 HoloLens 原生坐标)
                 # -----------------------------------
@@ -1670,8 +1728,8 @@ def main():
                         ee_pos, _ = robot_listener.get_current_pose()
                         
                         if ee_pos is not None:
-                            # 真实终点 (手上方的安全位置, Z轴抬高15cm, 向用户方向延伸一点)
-                            final_target_pos = global_holo_hand_pos + np.array([0, 0, 0.15]) 
+                            # 真实终点 (手上方的安全位置, Z轴抬高25cm, 向用户方向延伸一点)
+                            final_target_pos = global_holo_hand_pos + np.array([0, 0, 0.25]) 
                             
                             vec_to_target = final_target_pos - np.array(ee_pos)
                             dist_to_target = np.linalg.norm(vec_to_target)
