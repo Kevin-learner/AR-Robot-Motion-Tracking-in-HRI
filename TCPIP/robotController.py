@@ -13,6 +13,7 @@ except ImportError:
     print("⚠️ 警告: 未找到 franka_gripper 环境，请确保已 source ROS 工作空间！")
 import time
 import actionlib
+from geometry_msgs.msg import WrenchStamped
 
 class RobotController:
     def __init__(self):
@@ -64,6 +65,17 @@ class RobotController:
         
         self.Kp_servo = 2.0           # 3D 追踪的比例系数 (Kp)
         self.max_servo_vel = 0.1      # 最大直线追击速度: 0.1 m/s (10cm/s，非常安全)
+
+        # ====================================================
+        # 🦾【新增】力觉传感 (Wrench) 专用变量
+        # ====================================================
+        # 初始值为 0: [Fx, Fy, Fz, Tx, Ty, Tz]
+        self.current_wrench = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] 
+        
+        # 订阅 Franka 的外部估计力话题 (如果不叫这个名字，请用 rostopic list 检查)
+        self.wrench_topic = "/franka_state_controller/F_ext"
+        self.wrench_sub = rospy.Subscriber(self.wrench_topic, WrenchStamped, self._wrench_callback)
+        print(f">> 正在监听末端受力话题: {self.wrench_topic}")
 
         self.worker_thread = threading.Thread(target=self._tape_player_executor)
         self.worker_thread.setDaemon(True)
@@ -390,3 +402,21 @@ class RobotController:
         """
         if self.is_servoing and target_pos is not None:
             self.servo_target_p = np.array(target_pos)
+    
+    def _wrench_callback(self, msg):
+        """实时更新当前末端受力"""
+        self.current_wrench = [
+            msg.wrench.force.x,
+            msg.wrench.force.y,
+            msg.wrench.force.z,
+            msg.wrench.torque.x,
+            msg.wrench.torque.y,
+            msg.wrench.torque.z
+        ]
+
+    def get_wrench(self):
+        """
+        获取当前末端受力
+        :return: [Fx, Fy, Fz, Tx, Ty, Tz] (单位：牛顿 / 牛·米)
+        """
+        return self.current_wrench

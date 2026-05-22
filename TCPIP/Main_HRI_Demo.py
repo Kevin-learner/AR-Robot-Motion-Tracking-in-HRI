@@ -438,8 +438,11 @@ def main():
     STATE_LOOKING_FOR_USER = 6     # 6. 寻找用户来拿
     STATE_TRACKING_AND_PASS = 7     # 7. 跟踪并递给用户
     
+    has_completed_initial_scan = False
+
     current_hri_state = STATE_IDLE
     hri_start_time = 0.0     # 记录状态切换的时间，用于非阻塞等待
+    handover_dwell_start = 0.0
     
     # 定义机械臂初始观测位姿 (请替换为你实际的关节角或笛卡尔坐标)
     INIT_POSE = [0.3572, 0.0073, 0.5586, -0.68, 0.27, -0.63, 0.26]    # 1. State Tracking 的 PID 参数 (需要调试)
@@ -1231,18 +1234,21 @@ def main():
                             hri_start_time = 0.0
 
 # -----------------------------------
-                # 状态 3：全自动直线巡航建图 (彻底修复越界死锁版)
+                # 状态 3：全自动直线巡航建图 (一次扫描，多次复用版)
                 # -----------------------------------
                 elif current_hri_state == STATE_SCAN_OBJECTS:
                     
                     if hri_start_time == 0.0:
-                        print(f"\n🚀 [HRI] 状态 3: 启动全自动扫描。计划扫描点数: {SCAN_STEPS}")
-                        scene_mapper.clear()  
-                        scan_current_step = 0 
-                        
-                        if robot is not None:
-                            robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
-                        
+                        if not has_completed_initial_scan:
+                            print(f"\n🚀 [HRI] 状态 3: 启动首次全自动物理扫描。计划点数: {SCAN_STEPS}")
+                            scan_current_step = 0 
+                            if robot is not None:
+                                robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
+                        else:
+                            print(f"\n🚀 [HRI] 状态 3: 跳过物理扫描，直接复用并刷新已有环境记忆...")
+                            # 🌟 核心魔法：直接设为满值，跳过底下的所有拍照和移动！
+                            scan_current_step = SCAN_STEPS 
+                            
                         hri_start_time = time.time()
                         last_capture_time = 0.0 
                         
@@ -1253,18 +1259,16 @@ def main():
                         
                         if ee_pos is not None:
                             # =========================================================
-                            # 🌟 核心修复：只有在扫描步数没走完时，才计算路点目标
+                            # 【未走完步数时】：执行物理移动与采集
                             # =========================================================
                             if scan_current_step < SCAN_STEPS:
                                 target_pos = scan_waypoints[scan_current_step][0:3]
                                 dist = np.linalg.norm(np.array(ee_pos) - np.array(target_pos))
                                 
-                                # 阶段 A：如果还在移动路上
                                 if last_capture_time == 0.0:
                                     if dist < 0.02 and is_robot_idle: 
                                         print(f"📍 已到达节点 {scan_current_step + 1}！停顿 0.8 秒防抖...")
                                         last_capture_time = time.time()
-                                # 阶段 B：已经到达，防抖并拍照
                                 else:
                                     if time.time() - last_capture_time > 0.5: 
                                         print(f"📸 正在获取第 {scan_current_step + 1}/{SCAN_STEPS} 个视角的点云...")
@@ -1288,24 +1292,32 @@ def main():
                                         else:
                                             print(f"   ⚠️ 节点 {scan_current_step + 1} 数据获取失败，跳过。")
                                             
-                                        # 步数加 1
                                         scan_current_step += 1
-                                        
-                                        # 如果还有下一个点，继续让机械臂走
                                         if scan_current_step < SCAN_STEPS:
                                             if robot is not None:
                                                 robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
                                             last_capture_time = 0.0 
                             
                             # =========================================================
-                            # 🌟 核心修复：扫描步数全走完了，进入安全后处理与退回阶段
+                            # 【已走完或直接跳过时】：进入安全后处理与退回阶段
                             # =========================================================
                             else:
-                                # 子阶段 1：点云算法处理，并下发退回指令
                                 if getattr(scene_mapper, 'scan_post_process', 0) == 0:
-                                    print("\n🎉 [HRI] 全自动扫描任务完成！正在处理点云数据...")
+                                    print("\n🎉 [HRI] 开始处理/刷新点云地图数据...")
+                                    
+                                    # 🌟 标记：第一次完整的物理扫描已经完成了！以后都不用再扫了
+                                    has_completed_initial_scan = True 
                                     
                                     final_pcd = scene_mapper.global_pcd
+                                    
+                                    # 防崩保护：如果桌上的东西全抓完了，点云没了，直接跳回待机
+                                    if final_pcd is None or len(final_pcd.points) < 50:
+                                        print("⚠️ 桌面已空，没有足够的点云数据！自动切回待机状态...")
+                                        current_hri_state = STATE_IDLE
+                                        hri_start_time = 0.0
+                                        scene_mapper.scan_post_process = 0
+                                        continue
+
                                     print("   ✂️ 0. 正在进行 Z 轴高度直通滤波...")
                                     points = np.asarray(final_pcd.points)
                                     valid_z_indices = np.where(points[:, 2] >= -0.25)[0] 
@@ -1327,7 +1339,7 @@ def main():
                                     scene_mapper.table_z = np.mean(table_points[:, 2]) 
                                     print(f"   📏 测得桌面绝对物理高度: Z = {scene_mapper.table_z:.4f} 米")
                                     
-                                    print("   📦 3. 正在聚类并【彻底删除噪点】...")
+                                    print("   📦 3. 正在聚类剩余物体...")
                                     labels = np.array(objects_pcd.cluster_dbscan(eps=0.03, min_points=30))
                                     
                                     valid_mask = labels >= 0  
@@ -1347,16 +1359,15 @@ def main():
 
                                     scene_mapper.objects_pcd = clean_objects_pcd
                                     scene_mapper.object_labels = clean_labels
-                                    print(f"   ✅ 物品提取完毕！共发现 {clean_labels.max() + 1 if len(clean_labels)>0 else 0} 个纯净物体。")
+                                    print(f"   ✅ 环境刷新完毕！桌面剩余 {clean_labels.max() + 1 if len(clean_labels)>0 else 0} 个目标。")
                                     
-                                    print(f"   🤖 正在退回安全观测/递送准备位...")
+                                    print(f"   🤖 正在前往安全观测/递送准备位...")
                                     if robot is not None:
                                         robot.move_to(READY_FOR_PASSING_POSE, speed=0.05)
                                         
                                     scene_mapper.scan_post_process = 1  
                                     hri_start_time = time.time()
                                     
-                                # 子阶段 2：安全等待机器人退回到位
                                 elif getattr(scene_mapper, 'scan_post_process', 0) == 1:
                                     if is_robot_idle and (time.time() - hri_start_time > 1.0):
                                         print("\n👀 切换至状态 4: 请通过眼动凝视选择目标物体...")
@@ -1448,12 +1459,32 @@ def main():
                                             box_indices = np.where(scene_mapper.object_labels == box_id)[0]
                                             box_points = np.asarray(scene_mapper.objects_pcd.points)[box_indices]
 
-                                            # 1. 将 numpy 数组转为 Open3D 点云对象
+                                           # 1. 将 numpy 数组转为 Open3D 点云对象
                                             single_box_pcd = o3d.geometry.PointCloud()
                                             single_box_pcd.points = o3d.utility.Vector3dVector(box_points)
 
                                             # 2. 计算有向包围盒 (OBB)
                                             obb = single_box_pcd.get_oriented_bounding_box()
+
+                                            # =======================================================
+                                            # 🌟【修改 2】残影消除：把这个盒子从全局记忆地图中抹除！
+                                            # =======================================================
+                                            # 稍微放大一下 OBB (比如 1.2 倍)，确保边缘和底部的噪点也能被包裹进去
+                                            eraser_obb = o3d.geometry.OrientedBoundingBox(obb)
+                                            eraser_obb.scale(1.2, eraser_obb.center)
+                                            
+                                            # 获取全局地图中，落在这个“橡皮擦盒子”里的所有点的索引
+                                            ghost_indices = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.global_pcd.points)
+                                            
+                                            # 使用 invert=True 进行反向提取，相当于把这些点“抠除”
+                                            scene_mapper.global_pcd = scene_mapper.global_pcd.select_by_index(ghost_indices, invert=True)
+                                            
+                                            # 同步把这个物体从“磁铁”点云中剔除，防止接下来发生重复吸附
+                                            ghost_indices_obj = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.objects_pcd.points)
+                                            scene_mapper.objects_pcd = scene_mapper.objects_pcd.select_by_index(ghost_indices_obj, invert=True)
+                                            
+                                            print(f"🧹 已将 [盒子 {box_id}] 的残影从全局点云地图中永久擦除！")
+                                            # =======================================================
 
                                             # 3. 获取真正的几何中心 (这比 np.mean 准得多！)
                                             box_center = obb.center
@@ -1712,73 +1743,122 @@ def main():
                                 current_hri_state = STATE_TRACKING_AND_PASS
                                 hri_start_time = 0.0
 
-                # -----------------------------------
-                # 状态 7：平滑追踪递送 (基于 HoloLens 原生坐标)
+# -----------------------------------
+                # 状态 7：平滑追踪 -> 稳定 -> 下降力控递送
                 # -----------------------------------
                 elif current_hri_state == STATE_TRACKING_AND_PASS:
-                    # 刚进入状态，开启伺服
+                    # 刚进入状态，初始化
                     if hri_start_time == 0.0:
                         if robot is not None:
                             robot.start_servoing()
                         hri_start_time = time.time()
-                        print("🚀 [HRI] 正在向您的手掌递送物品...")
-                    
-                    # 🌟 核心：使用 HoloLens 传来的原生手掌坐标
-                    if global_holo_hand_pos is not None:
-                        ee_pos, _ = robot_listener.get_current_pose()
+                        handover_dwell_start = 0.0
+                        scene_mapper.pass_step = 0  # 0: 追踪与稳定, 1: 下降与检测受力
+                        print("🚀 [HRI] 正在向您的手掌上方移动...")
+
+                    # =========================================================
+                    # 阶段 0：3D 伺服追踪，直到在手掌上方 25cm 处稳定 1 秒
+                    # =========================================================
+                    if getattr(scene_mapper, 'pass_step', 0) == 0:
+                        if global_holo_hand_pos is not None:
+                            ee_pos, _ = robot_listener.get_current_pose()
+                            
+                            if ee_pos is not None:
+                                # 真实终点 (手上方的安全位置, Z轴抬高25cm)
+                                final_target_pos = global_holo_hand_pos + np.array([0, 0, 0.25]) 
+                                
+                                vec_to_target = final_target_pos - np.array(ee_pos)
+                                dist_to_target = np.linalg.norm(vec_to_target)
+                                
+                                # 🦾 控制层：持续更新伺服目标
+                                if robot is not None:
+                                    robot.update_servo_target(final_target_pos)
+                                
+                                # 🌟 视觉层：发送预测路径给 HoloLens
+                                if T_M is not None and (time.time() - last_ray_print_time > 0.1):
+                                    full_visual_path = []
+                                    num_visual_points = 10
+                                    for i in range(num_visual_points + 1):
+                                        ratio = i / float(num_visual_points)
+                                        pt = np.array(ee_pos) + ratio * vec_to_target
+                                        full_visual_path.append(pt)
+                                    send_path_to_hololens(conn, full_visual_path, T_M)
+                                    last_ray_print_time = time.time()
+
+                                # 🤝 稳定停留检测
+                                if dist_to_target < 0.02:
+                                    if handover_dwell_start == 0.0:
+                                        handover_dwell_start = time.time()
+                                        print("⏳ [HRI] 机械臂已就位，请保持手部稳定 1 秒钟...")
+                                        
+                                    elif time.time() - handover_dwell_start >= 1.0:
+                                        print("⬇️ [HRI] 追踪稳定！停止伺服，开始缓慢下降并检测触碰...")
+                                        
+                                        # 停止水平追踪
+                                        if robot is not None:
+                                            robot.stop_servoing() 
+                                            
+                                        # 设定下降目标：当前位置往下压 15cm
+                                        descend_target_pos = np.array(ee_pos) - np.array([0, 0, 0.15])
+                                        if robot is not None:
+                                            # 使用 0.02 的极低速度缓慢下放，像人类递水杯一样
+                                            robot.move_to(descend_target_pos, speed=0.02)
+                                        
+                                        # 切换到阶段 1
+                                        scene_mapper.pass_step = 1
+                                else:
+                                    if handover_dwell_start != 0.0:
+                                        print("⚠️ [HRI] 目标移动，正在重新追踪...")
+                                        handover_dwell_start = 0.0
+
+                    # =========================================================
+                    # 阶段 1：缓慢下降，同时高频检测 Z 轴受力
+                    # =========================================================
+                    elif getattr(scene_mapper, 'pass_step', 0) == 1:
                         
-                        if ee_pos is not None:
-                            # 真实终点 (手上方的安全位置, Z轴抬高25cm, 向用户方向延伸一点)
-                            final_target_pos = global_holo_hand_pos + np.array([0, 0, 0.25]) 
+                        force_triggered = False
+                        
+                        # 💡 请替换为你实际获取机械臂末端受力的函数！
+                        # 假设返回的是 [Fx, Fy, Fz, Tx, Ty, Tz]
+                        try:
+                            # -------- ⚠️ 需要修改这里 ⚠️ --------
+                            wrench = robot.get_wrench() 
+                            fz = wrench[2]  # 获取 Z 轴受力 (牛顿)
+                            # ------------------------------------
                             
-                            vec_to_target = final_target_pos - np.array(ee_pos)
-                            dist_to_target = np.linalg.norm(vec_to_target)
+                            # 设定力觉触发阈值：只要 Z 轴受力变化超过 3 牛顿 (约 300g 的托力或拽力)
+                            FORCE_THRESHOLD = 3.0 
+                            if abs(fz) > FORCE_THRESHOLD:
+                                force_triggered = True
+                                print(f"🖐️ [HRI] 检测到接触力 (Fz={fz:.2f}N)！用户已接稳！")
+                                
+                        except Exception as e:
+                            # 如果你还没写好获取力的接口，可以保留这里防崩，它会一直往下走直到走完 15cm
+                            pass
                             
-                            # =========================================================
-                            # 🦾 控制层：直接把最终目标丢给伺服函数
-                            # =========================================================
+                        # 如果检测到了力，或者机械臂已经走完下降的 15cm (兜底保护)
+                        is_robot_idle = robot.path_queue.empty() if robot is not None else True
+                        
+                        if force_triggered or is_robot_idle:
+                            if force_triggered and robot is not None:
+                                # 紧急清空移动队列，刹停下降动作
+                                robot.path_queue.queue.clear() 
+                                
+                            print("🤝 [HRI] 释放物品！")
+                            time.sleep(0.2) # 给 0.2 秒让受力缓冲一下
+                            
                             if robot is not None:
-                                robot.update_servo_target(final_target_pos)
+                                robot.open_gripper(width=0.08) 
                             
-                            # =========================================================
-                            # 🌟 视觉层：规划完整路径并发送给 HoloLens
-                            # =========================================================
-                            if T_M is not None and (time.time() - last_ray_print_time > 0.1):
-                                full_visual_path = []
-                                num_visual_points = 10
-                                for i in range(num_visual_points + 1):
-                                    ratio = i / float(num_visual_points)
-                                    pt = np.array(ee_pos) + ratio * vec_to_target
-                                    full_visual_path.append(pt)
+                            if T_M is not None:
+                                send_path_to_hololens(conn, [], T_M)
                                 
-                                send_path_to_hololens(conn, full_visual_path, T_M)
-                                last_ray_print_time = time.time()
-
-                            # =========================================================
-                            # 🤝 到达与放手检测
-                            # =========================================================
-                            # 到达 5cm 内，自动放手
-                            if dist_to_target < 0.05:
-                                print("🤝 [HRI] 递送完成，请接好！")
-                                
-                                # 放手前必须先停止伺服追击
-                                if robot is not None:
-                                    robot.stop_servoing() 
-                                    
-                                time.sleep(0.5) # 稍微停顿，建立心理安全感
-                                
-                                if robot is not None:
-                                    robot.open_gripper(width=0.08) 
-                                
-                                # 清除 HoloLens 里的预测线条
-                                if T_M is not None:
-                                    send_path_to_hololens(conn, [], T_M)
-                                    
-                                # 彻底完成，重置状态与变量
-                                current_hri_state = STATE_IDLE
-                                hri_start_time = 0.0
-                                global_holo_hand_pos = None
-
+                            # 彻底完成，重置状态与变量
+                            current_hri_state = STATE_IDLE
+                            hri_start_time = 0.0
+                            handover_dwell_start = 0.0
+                            global_holo_hand_pos = None
+                            scene_mapper.pass_step = 0
     except Exception as e:
         print(f"[TCP] Server Error: {e}")
 
