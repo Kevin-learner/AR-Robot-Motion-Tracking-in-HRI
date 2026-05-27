@@ -1612,7 +1612,7 @@ def main():
                         elif getattr(scene_mapper, 'grasp_step', 0) == 3 and time.time() - hri_start_time > 0.5: 
                             print("   -> 🚀 阶段 4：提拉物品...")
                             if robot is not None:
-                                robot.move_to(scene_mapper.lift_pose, speed=0.03) # 提拉稍微快一点点
+                                robot.move_to(scene_mapper.lift_pose, speed=0.05) # 提拉稍微快一点点
                                 
                             scene_mapper.grasp_step = 4
                             hri_start_time = time.time()
@@ -1722,7 +1722,7 @@ def main():
                                     
                                     # 🌟 触发移动到夹爪向下的准备姿态
                                     if robot is not None:
-                                        robot.move_to(READY_FOR_PASSING_POSE, speed=0.05)
+                                        robot.move_to(READY_FOR_PASSING_POSE, speed=0.08)
                                     
                                     scene_mapper.looking_step = 2 # 切换到阶段 2
                                     hri_start_time = time.time()  # 重置计时器
