@@ -1743,8 +1743,8 @@ def main():
                                 current_hri_state = STATE_TRACKING_AND_PASS
                                 hri_start_time = 0.0
 
-# -----------------------------------
-                # 状态 7：平滑追踪 -> 稳定 -> 下降力控递送
+                # -----------------------------------
+                # 状态 7：平滑追踪 -> 稳定 -> 下降力控递送 
                 # -----------------------------------
                 elif current_hri_state == STATE_TRACKING_AND_PASS:
                     # 刚进入状态，初始化
@@ -1753,28 +1753,24 @@ def main():
                             robot.start_servoing()
                         hri_start_time = time.time()
                         handover_dwell_start = 0.0
-                        scene_mapper.pass_step = 0  # 0: 追踪与稳定, 1: 下降与检测受力
+                        scene_mapper.pass_step = 0  
                         print("🚀 [HRI] 正在向您的手掌上方移动...")
 
                     # =========================================================
-                    # 阶段 0：3D 伺服追踪，直到在手掌上方 25cm 处稳定 1 秒
+                    # 阶段 0：3D 伺服追踪，直到在手掌上方稳定停留
                     # =========================================================
                     if getattr(scene_mapper, 'pass_step', 0) == 0:
                         if global_holo_hand_pos is not None:
-                            ee_pos, _ = robot_listener.get_current_pose()
+                            ee_pos, ee_quat = robot_listener.get_current_pose() # 🌟 确保获取 ee_quat
                             
                             if ee_pos is not None:
-                                # 真实终点 (手上方的安全位置, Z轴抬高25cm)
                                 final_target_pos = global_holo_hand_pos + np.array([0, 0, 0.25]) 
-                                
                                 vec_to_target = final_target_pos - np.array(ee_pos)
                                 dist_to_target = np.linalg.norm(vec_to_target)
                                 
-                                # 🦾 控制层：持续更新伺服目标
                                 if robot is not None:
                                     robot.update_servo_target(final_target_pos)
                                 
-                                # 🌟 视觉层：发送预测路径给 HoloLens
                                 if T_M is not None and (time.time() - last_ray_print_time > 0.1):
                                     full_visual_path = []
                                     num_visual_points = 10
@@ -1785,67 +1781,73 @@ def main():
                                     send_path_to_hololens(conn, full_visual_path, T_M)
                                     last_ray_print_time = time.time()
 
-                                # 🤝 稳定停留检测
-                                if dist_to_target < 0.02:
-                                    if handover_dwell_start == 0.0:
+                                # 带迟滞区间的防抖读秒
+                                if handover_dwell_start == 0.0:
+                                    if dist_to_target < 0.06:
                                         handover_dwell_start = time.time()
                                         print("⏳ [HRI] 机械臂已就位，请保持手部稳定 1 秒钟...")
+                                else:
+                                    if dist_to_target > 0.10:
+                                        print("⚠️ [HRI] 目标大幅移动，打断稳定计时，重新追踪...")
+                                        handover_dwell_start = 0.0
                                         
-                                    elif time.time() - handover_dwell_start >= 1.0:
+                                    elif time.time() - handover_dwell_start >= 0.5:
                                         print("⬇️ [HRI] 追踪稳定！停止伺服，开始缓慢下降并检测触碰...")
                                         
-                                        # 停止水平追踪
                                         if robot is not None:
                                             robot.stop_servoing() 
                                             
-                                        # 设定下降目标：当前位置往下压 15cm
-                                        descend_target_pos = np.array(ee_pos) - np.array([0, 0, 0.15])
-                                        if robot is not None:
-                                            # 使用 0.02 的极低速度缓慢下放，像人类递水杯一样
-                                            robot.move_to(descend_target_pos, speed=0.02)
+                                        # 🌟【核心修复】：将 3维位置 与 4维姿态 拼装成 7维 Pose 列表
+                                        descend_target_p = np.array(ee_pos) - np.array([0, 0, 0.20])
+                                        descend_full_pose = list(descend_target_p) + list(ee_quat)
                                         
-                                        # 切换到阶段 1
+                                        if robot is not None:
+                                            robot.move_to(descend_full_pose, speed=0.03)
+                                        
                                         scene_mapper.pass_step = 1
-                                else:
-                                    if handover_dwell_start != 0.0:
-                                        print("⚠️ [HRI] 目标移动，正在重新追踪...")
-                                        handover_dwell_start = 0.0
-
+                                        
                     # =========================================================
-                    # 阶段 1：缓慢下降，同时高频检测 Z 轴受力
+                    # 阶段 1：缓慢下降，同时高频检测 Z 轴受力 (修复起步惯性误触)
                     # =========================================================
                     elif getattr(scene_mapper, 'pass_step', 0) == 1:
                         
                         force_triggered = False
                         
-                        # 💡 请替换为你实际获取机械臂末端受力的函数！
-                        # 假设返回的是 [Fx, Fy, Fz, Tx, Ty, Tz]
-                        try:
-                            # -------- ⚠️ 需要修改这里 ⚠️ --------
-                            wrench = robot.get_wrench() 
-                            fz = wrench[2]  # 获取 Z 轴受力 (牛顿)
-                            # ------------------------------------
-                            
-                            # 设定力觉触发阈值：只要 Z 轴受力变化超过 3 牛顿 (约 300g 的托力或拽力)
-                            FORCE_THRESHOLD = 3.0 
-                            if abs(fz) > FORCE_THRESHOLD:
-                                force_triggered = True
-                                print(f"🖐️ [HRI] 检测到接触力 (Fz={fz:.2f}N)！用户已接稳！")
+                        # 🌟 新增：起步动力学缓冲计时器
+                        if not hasattr(scene_mapper, 'descent_start_time'):
+                            scene_mapper.descent_start_time = time.time()
+                        
+                        # 🌟 核心：给机械臂 0.5 秒钟的时间加速到匀速，这期间不测力！
+                        if time.time() - scene_mapper.descent_start_time > 0.5:
+                            try:
+                                wrench = robot.get_wrench() 
+                                current_fz = wrench[2] 
                                 
-                        except Exception as e:
-                            # 如果你还没写好获取力的接口，可以保留这里防崩，它会一直往下走直到走完 15cm
-                            pass
+                                # 在匀速阶段记录基准力，此时受力极其稳定
+                                if not hasattr(scene_mapper, 'baseline_fz'):
+                                    scene_mapper.baseline_fz = current_fz
+                                    print(f"⚖️ [HRI] 运动已平稳，记录基准受力: Fz = {current_fz:.2f}N")
+                                
+                                delta_fz = abs(current_fz - scene_mapper.baseline_fz)
+                                
+                                # 稍微提高一点点阈值增加鲁棒性 (3.5N)
+                                FORCE_THRESHOLD = 3.5 
+                                if delta_fz > FORCE_THRESHOLD:
+                                    force_triggered = True
+                                    print(f"🖐️ [HRI] 检测到接触力变化 (ΔFz={delta_fz:.2f}N)！用户已接稳！")
+                                    
+                            except Exception as e:
+                                pass
                             
-                        # 如果检测到了力，或者机械臂已经走完下降的 15cm (兜底保护)
                         is_robot_idle = robot.path_queue.empty() if robot is not None else True
                         
-                        if force_triggered or is_robot_idle:
-                            if force_triggered and robot is not None:
-                                # 紧急清空移动队列，刹停下降动作
+                        # 情况 A：成功摸到了手
+                        if force_triggered:
+                            if robot is not None:
                                 robot.path_queue.queue.clear() 
                                 
-                            print("🤝 [HRI] 释放物品！")
-                            time.sleep(0.2) # 给 0.2 秒让受力缓冲一下
+                            print("🤝 [HRI] 成功移交，释放物品！")
+                            time.sleep(0.2) 
                             
                             if robot is not None:
                                 robot.open_gripper(width=0.08) 
@@ -1853,12 +1855,39 @@ def main():
                             if T_M is not None:
                                 send_path_to_hololens(conn, [], T_M)
                                 
-                            # 彻底完成，重置状态与变量
-                            current_hri_state = STATE_IDLE
+                            current_hri_state = STATE_SCAN_OBJECTS
                             hri_start_time = 0.0
                             handover_dwell_start = 0.0
                             global_holo_hand_pos = None
                             scene_mapper.pass_step = 0
+                            
+                            # 🧹 清理内存
+                            if hasattr(scene_mapper, 'baseline_fz'): del scene_mapper.baseline_fz
+                            if hasattr(scene_mapper, 'descent_start_time'): del scene_mapper.descent_start_time
+                                
+                        # 情况 B：走到底了没摸到力 (扑空回收)
+                        elif is_robot_idle:
+                            # 注意：如果是前 0.5s 还没有路径进入队列，可能会误判 idle，所以要确保过了缓冲期
+                            if time.time() - getattr(scene_mapper, 'descent_start_time', 0) > 0.5:
+                                print("⚠️ [HRI] 递送扑空！未检测到手部支撑。")
+                                print("🔄 [HRI] 取消释放，正在退回安全高度...")
+                                
+                                ee_pos, ee_quat = robot_listener.get_current_pose()
+                                if ee_pos is not None:
+                                    retreat_target_p = np.array(ee_pos) + np.array([0, 0, 0.15])
+                                    retreat_full_pose = list(retreat_target_p) + list(ee_quat)
+                                    
+                                    if robot is not None:
+                                        robot.move_to(retreat_full_pose, speed=0.05)
+                                
+                                scene_mapper.pass_step = 0
+                                handover_dwell_start = 0.0
+                                
+                                # 🧹 清理内存
+                                if hasattr(scene_mapper, 'baseline_fz'): del scene_mapper.baseline_fz
+                                if hasattr(scene_mapper, 'descent_start_time'): del scene_mapper.descent_start_time
+
+
     except Exception as e:
         print(f"[TCP] Server Error: {e}")
 
