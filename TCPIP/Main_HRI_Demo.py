@@ -9,6 +9,7 @@ import cv2
 from scipy.spatial.transform import Rotation as R
 from collections import deque
 import open3d as o3d
+from concurrent.futures import ThreadPoolExecutor
 
 # netsh interface portproxy add v4tov4 listenaddress=192.168.137.1 listenport=[本地监听端口] connectaddress=[机械臂的Tailscale IP] connectport=[机械臂服务端口]
 
@@ -50,6 +51,8 @@ PORT = config['tcp']['port']
 ROBOT_POS_FILE = config['robot']['position_file']
 RECORD_FILE = config['recording']['output_file'] #  保存路径
 EE_T_C = np.array(config['handeyecalibration']['EE_T_C']) # 从配置加载 EE_T_C
+
+executor = ThreadPoolExecutor(max_workers=1)
 
 # import calibration module
 try:
@@ -97,7 +100,7 @@ except ImportError:
 
 try:
     import BodyPointCloud_dual
-    from BodyPointCloud_dual import Body3DSkeletonProcess_dual
+    from BodyPointCloud_dual import Body3DSkeletonProcess_dual, K_1
     print("✅ BodyPointCloud 导入完毕！")
 except ImportError:
     print("⚠️ Warning: BodyPointCloud_dual.py not found. Skeleton tracking disabled.")
@@ -134,6 +137,12 @@ except ImportError:
     print("⚠️ Warning: gaze_interaction.py not found. No way to compute gaze interaction.")
     get_gaze_point_cloud_intersection = None
     PointCloudAccumulator = None
+
+try:
+    from request_grasps import request_grasps_from_graspnet
+except ImportError:
+    print("⚠️ Warning: request_grasps.py not found. No way to compute grasp pose.")
+
 
 # -------------------------------------------------
 # 2. 核心与辅助函数
@@ -407,6 +416,9 @@ def main():
     sSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sSock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    sSock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 20 * 1024 * 1024)
+    sSock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
     T_M = None 
 
@@ -1233,7 +1245,7 @@ def main():
                             current_hri_state = STATE_SCAN_OBJECTS
                             hri_start_time = 0.0
 
-# -----------------------------------
+                # -----------------------------------
                 # 状态 3：全自动直线巡航建图 (一次扫描，多次复用版)
                 # -----------------------------------
                 elif current_hri_state == STATE_SCAN_OBJECTS:
@@ -1330,6 +1342,42 @@ def main():
                                     scene_mapper.display_pcd.points = cleaned_pcd.points
                                     scene_mapper.display_pcd.colors = cleaned_pcd.colors
                                     scene_mapper.update_window()
+
+                                    try:
+                                        # 保存为 .pcd 格式 (你可以换成 .ply 格式)
+                                        o3d.io.write_point_cloud("scanned_scene.pcd", cleaned_pcd)
+                                        print("   💾 [系统] 已将当前桌面点云成功保存为 scanned_scene.pcd")
+                                    except Exception as e:
+                                        print(f"   ❌ [系统] 保存点云失败: {e}")
+                                    
+                                    if request_grasps_from_graspnet is not None:
+                                        print("\n   📦 准备打包真实点云与相机内参 K_1...")
+                                        
+                                        # 1. 获取当前拍照位置的相机到机器人基座的变换矩阵
+                                        ee_pos, ee_quat = robot_listener.get_current_pose()
+                                        ROBOT_T_C = camera2unity.get_camera_to_robot_matrix(ee_pos, ee_quat, EE_T_C)
+
+                                        # 2. 计算逆矩阵（从机器人基座转回相机坐标系）
+                                        C_T_ROBOT = np.linalg.inv(ROBOT_T_C)
+
+                                        # 3. 提取去噪后的干净点云，并将其【逆变换】回相机坐标系
+                                        real_points_base = np.asarray(cleaned_pcd.points)
+                                        ones = np.ones((real_points_base.shape[0], 1))
+                                        points_hom = np.hstack((real_points_base, ones))
+                                        # 关键：转回相机系，网络就能看懂了！
+                                        real_points_camera = (C_T_ROBOT @ points_hom.T).T[:, :3] 
+
+                                        real_colors = np.asarray(cleaned_pcd.colors) if cleaned_pcd.has_colors() else np.zeros_like(real_points_base)
+
+                                        # 4. 把【相机系下的点云】发给后台线程
+                                        def ai_task(points, colors, K, ip):
+                                            return request_grasps_from_graspnet(points, colors, K, server_ip=ip)
+
+                                        # 注意：这里传入保存当前位置的 ROBOT_T_C，用于后面把结果转回来
+                                        future = executor.submit(ai_task, real_points_camera, real_colors, K_1, "100.116.99.44")
+                                        scene_mapper.current_robot_t_c = ROBOT_T_C # 暂存这个矩阵
+                                        scene_mapper.ai_future = future
+                                        scene_mapper.scan_post_process = 2
                                     
                                     print("   🪚 2. 正在识别桌面 (RANSAC)...")
                                     plane_model, inliers = cleaned_pcd.segment_plane(distance_threshold=0.01, ransac_n=3, num_iterations=1000)
@@ -1365,15 +1413,42 @@ def main():
                                     if robot is not None:
                                         robot.move_to(READY_FOR_PASSING_POSE, speed=0.05)
                                         
-                                    scene_mapper.scan_post_process = 1  
+                                    #scene_mapper.scan_post_process = 1  
                                     hri_start_time = time.time()
                                     
+
+                                
+                                elif getattr(scene_mapper, 'scan_post_process', 0) == 2:
+                                    if scene_mapper.ai_future.done():
+                                        # 🌟 AI 在相机系下预测出来的原始结果
+                                        ai_grasps_camera = scene_mapper.ai_future.result() 
+                                        
+                                        if ai_grasps_camera is not None:
+                                            print(f"🧠 AI 在相机系下预测了 {ai_grasps_camera.shape[0]} 个姿态，正在正变换至机器人基座...")
+                                            
+                                            # 拿出刚才状态 3 存下来的那一瞬间的 ROBOT_T_C
+                                            ROBOT_T_C = scene_mapper.current_robot_t_c
+                                            ai_grasps_base = np.zeros_like(ai_grasps_camera)
+                                            
+                                            # 🌟 矩阵左乘变换：将相机系抓取转为机器人基座系
+                                            for i in range(ai_grasps_camera.shape[0]):
+                                                ai_grasps_base[i] = ROBOT_T_C @ ai_grasps_camera[i]
+                                                
+                                            scene_mapper.ai_grasps = ai_grasps_base
+                                            
+                                            # 自动保存到本地文件
+                                            np.save("test_output_grasps.npy", ai_grasps_base)
+                                            print("🎉 [AI] 异步推理并坐标对齐成功完成！文件已保存。")
+                                            
+                                        scene_mapper.scan_post_process = 1
+                                        
                                 elif getattr(scene_mapper, 'scan_post_process', 0) == 1:
                                     if is_robot_idle and (time.time() - hri_start_time > 1.0):
                                         print("\n👀 切换至状态 4: 请通过眼动凝视选择目标物体...")
                                         current_hri_state = STATE_GAZE_INTERSECTION
                                         hri_start_time = 0.0
                                         scene_mapper.scan_post_process = 0 # 重置标记
+
                 # -----------------------------------
                 # 状态 4：全景眼动求交 + 纯净物品吸附
                 # -----------------------------------

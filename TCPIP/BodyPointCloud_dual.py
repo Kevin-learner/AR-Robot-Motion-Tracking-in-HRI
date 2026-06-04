@@ -26,6 +26,18 @@ def detect_realsense_devices():
         serial = dev.get_info(rs.camera_info.serial_number)
         serials.append(serial)
     return serials
+
+def get_k_matrix(rs_intrinsics):
+    """
+    3x3 K
+    """
+    K = np.array([
+        [rs_intrinsics.fx, 0, rs_intrinsics.ppx],
+        [0, rs_intrinsics.fy, rs_intrinsics.ppy],
+        [0, 0, 1]
+    ], dtype=np.float32)
+    return K
+
 class AppState:
 
     def __init__(self, *args, **kwargs):
@@ -90,6 +102,7 @@ depth_intrinsics_1 = depth_profile_1.get_intrinsics()
 w_1, h_1 = depth_intrinsics_1.width, depth_intrinsics_1.height
 pc_1 = rs.pointcloud()
 colorizer_1 = rs.colorizer()
+K_1 = get_k_matrix(depth_intrinsics_1)
 
 # --------- Pipeline 2 Configuration---------
 if use_dual_camera:
