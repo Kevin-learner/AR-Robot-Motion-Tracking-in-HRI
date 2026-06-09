@@ -324,6 +324,115 @@ class RobotController:
         path_list = [{'pos': target_pos, 'rot': target_rot}]
         self.execute_path(path_list, speed)
 
+    def is_rotation_reached(self, target_quat, tolerance_deg=1.5):
+        """
+        严格检查手腕实际姿态是否已经旋转就位（防止平移到了、旋转没到就抢跑）
+        :param target_quat: 目标四元数 [qx, qy, qz, qw]
+        :param tolerance_deg: 允许的旋转残余角度（度），默认 1.5 度以内算就位
+        """
+        _, curr_r = self.get_current_pose()
+        if curr_r is None: return False
+        
+        # 计算两个四元数的点积
+        dot_product = np.clip(np.dot(curr_r, target_quat), -1.0, 1.0)
+        # 计算残余夹角 (弧度)
+        residual_angle = 2.0 * math.acos(abs(dot_product))
+        residual_deg = math.degrees(residual_angle)
+        
+        # 如果残余角度小于设定容差，返回 True 放行
+        if residual_deg <= tolerance_deg:
+            return True
+        else:
+            # 调试打印，方便你在控制台盯着它扭动
+            # print(f"⏳ [手腕对齐中] 旋转残余角度: {residual_deg:.1f}° / 容许值: {tolerance_deg}°")
+            return False
+        
+    # =================================================================
+    # 🦾【新增工业级直插接口】强行锁死姿态的纯笛卡尔 Z 轴直下运动
+    # =================================================================
+    def move_straight_down(self, target_pose, speed=0.02):
+        """
+        以绝对刚性的姿态锁死模式，垂直直线切入目标点（解决下探晃动碰壁的特效药）
+        :param target_pose: 包含 7 个元素的终点列表 [X, Y, Z, qx, qy, qz, qw]
+        """
+        if target_pose is None or len(target_pose) != 7: return
+        
+        # 1. 拦截当前一瞬间机械臂最真实的物理姿态，作为接下来的刚体姿态基准
+        start_p, start_r = self.get_current_pose()
+        if start_p is None: return
+        
+        # 目标绝对平移点
+        target_pos = np.array(target_pose[0:3])
+        
+        # 2. 清空之前的队列
+        with self.path_queue.mutex:
+            self.path_queue.queue.clear()
+            
+        # 3. 强行重采样：位置按 S 曲线走，但姿态全场死死咬住 start_r，拒绝任何 SLERP 扭动！
+        total_dist = np.linalg.norm(target_pos - start_p)
+        total_time = total_dist / (speed + 1e-6)
+        total_time = max(total_time, 0.1) # 兜底
+        
+        total_steps = int(total_time * self.rate_hz)
+        
+        for i in range(1, total_steps + 1):
+            t = i / float(total_steps)
+            smooth_t = (1.0 - math.cos(t * math.pi)) / 2.0
+            
+            # 位置沿直线连续插入
+            curr_p = start_p + (target_pos - start_p) * smooth_t
+            
+            # 🌟 核心魔法：姿态不做任何插值运算，直接强行克隆起步姿态！
+            curr_r = start_r.copy()
+            
+            self.path_queue.put((curr_p, curr_r))
+            
+        print(f"🔒 [Pose Locked] 已生成刚性直线物理轨迹：下探 {total_dist*100:.1f}cm，姿态 100% 强行锁死，耗时 {total_time:.2f} 秒")
+
+    # =================================================================
+    # 🚀【战术升级】绝对姿态锁死 且 沿夹爪局部 Z 轴斜向直插接口
+    # =================================================================
+    def move_along_local_z(self, stroke_distance=0.15, speed=0.02):
+        """
+        顺着当前夹爪指尖指向的局部 Z 轴方向，笔直向前推进（斜向直插，彻底解决倾斜物体碰壁）
+        :param stroke_distance: 下探推进的绝对物理距离（米），比如从悬停点到抓取点是 15 厘米，就传 0.15
+        :param speed: 推进速度 (m/s)
+        """
+        # 1. 强行拦截当前悬停点最真实的物理位姿
+        start_p, start_r = self.get_current_pose()
+        if start_p is None: return
+        
+        # 2. 数学魔法：利用当前四元数换算出局部 +Z 轴在世界系下的方向矢量
+        from scipy.spatial.transform import Rotation as Rot
+        R_curr = Rot.from_quat(start_r).as_matrix()
+        # 在 Contact-GraspNet/Franka 规范中，旋转矩阵的第三列 [:3, 2] 就是局部 +Z 轴（进近方向）
+        approach_vector = R_curr[:3, 2]
+        
+        # 3. 计算终点的绝对 3D 坐标 (起点位置 + 推进长度 * 方向矢量)
+        target_pos = start_p + stroke_distance * approach_vector
+        
+        # 4. 清空旧队列
+        with self.path_queue.mutex:
+            self.path_queue.queue.clear()
+            
+        # 5. S 曲线重采样：位置沿着这条倾斜的“局部射线”连续高精插值，姿态全场刚性锁死！
+        total_time = stroke_distance / (speed + 1e-6)
+        total_time = max(total_time, 0.1)
+        total_steps = int(total_time * self.rate_hz)
+        
+        for i in range(1, total_steps + 1):
+            t = i / float(total_steps)
+            smooth_t = (1.0 - math.cos(t * math.pi)) / 2.0
+            
+            # 沿着局部 Z 轴射线斜向推进
+            curr_p = start_p + (target_pos - start_p) * smooth_t
+            # 姿态绝对锁死，拒绝任何扭动
+            curr_r = start_r.copy()
+            
+            self.path_queue.put((curr_p, curr_r))
+            
+        print(f"🔒 [Local Z Injection] 刚性斜插轨迹已生成：沿局部 Z 轴推进 {stroke_distance*100:.1f}cm，姿态死锁，耗时 {total_time:.2f} 秒")
+
     # ==========================================
     # 🌟 Franka 夹爪控制接口
     # ==========================================

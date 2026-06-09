@@ -1317,9 +1317,6 @@ def main():
                                 if getattr(scene_mapper, 'scan_post_process', 0) == 0:
                                     print("\n🎉 [HRI] 开始处理/刷新点云地图数据...")
                                     
-                                    # 🌟 标记：第一次完整的物理扫描已经完成了！以后都不用再扫了
-                                    has_completed_initial_scan = True 
-                                    
                                     final_pcd = scene_mapper.global_pcd
                                     
                                     # 防崩保护：如果桌上的东西全抓完了，点云没了，直接跳回待机
@@ -1350,7 +1347,7 @@ def main():
                                     except Exception as e:
                                         print(f"   ❌ [系统] 保存点云失败: {e}")
                                     
-                                    if request_grasps_from_graspnet is not None:
+                                    if request_grasps_from_graspnet is not None and not has_completed_initial_scan:
                                         print("\n   📦 准备打包真实点云与相机内参 K_1...")
                                         
                                         # 1. 获取当前拍照位置的相机到机器人基座的变换矩阵
@@ -1379,6 +1376,9 @@ def main():
                                         scene_mapper.ai_future = future
                                         scene_mapper.scan_post_process = 2
                                     
+                                    # 🌟 标记：第一次完整的物理扫描已经完成了！以后都不用再扫了
+                                    has_completed_initial_scan = True 
+
                                     print("   🪚 2. 正在识别桌面 (RANSAC)...")
                                     plane_model, inliers = cleaned_pcd.segment_plane(distance_threshold=0.01, ransac_n=3, num_iterations=1000)
                                     objects_pcd = cleaned_pcd.select_by_index(inliers, invert=True)
@@ -1413,7 +1413,8 @@ def main():
                                     if robot is not None:
                                         robot.move_to(READY_FOR_PASSING_POSE, speed=0.05)
                                         
-                                    #scene_mapper.scan_post_process = 1  
+                                    if getattr(scene_mapper, 'scan_post_process', 0) != 2:
+                                        scene_mapper.scan_post_process = 1
                                     hri_start_time = time.time()
                                     
 
@@ -1530,6 +1531,34 @@ def main():
                                             # 成功吸附！获取盒子 ID（因为噪点被删了，这里必定是有效盒子）
                                             box_id = scene_mapper.object_labels[idx[0]]
                                             
+                                            # =======================================================
+                                            # 🔍【全面诊断补丁】打印所有盒子中心、视线落点及吸附过程
+                                            # =======================================================
+                                            print("\n" + "🔍" * 20)
+                                            print(f"🎯 [Gaze Debug] 视线在世界系(机器人基座)下的实时落点: {np.round(fixation_point, 3)}")
+                                            print(f"🧲 [Gaze Debug] KDTree 离你眼睛最近的点距离是: {np.round(distance_to_box * 100, 1)} cm")
+                                            
+                                            # 遍历当前场景里所有被分割出来的不同盒子，算出它们各自的中心点
+                                            unique_labels = np.unique(scene_mapper.object_labels)
+                                            print(f"📦 [Gaze Debug] 当前大记忆地图中一共检测到 {len(unique_labels)} 个物体:")
+                                            
+                                            for label in unique_labels:
+                                                # 提取这个标签对应的所有点
+                                                lbl_indices = np.where(scene_mapper.object_labels == label)[0]
+                                                lbl_points = np.asarray(scene_mapper.objects_pcd.points)[lbl_indices]
+                                                
+                                                # 粗略算一下这个盒子的中心（这里用 mean 快速计算用于诊断）
+                                                lbl_center = np.mean(lbl_points, axis=0)
+                                                
+                                                # 计算你的眼睛落点到这个盒子中心的距离
+                                                dist_from_gaze = np.linalg.norm(fixation_point - lbl_center)
+                                                
+                                                # 如果这个标签刚好是被吸附的标签，加个醒目的五星标记
+                                                flag = "⭐ [已锁定录用]" if label == box_id else "  "
+                                                print(f"   {flag} 物体ID {label} -> 几何中心: {np.round(lbl_center, 3)} | 离你视线落点距离: {np.round(dist_from_gaze * 100, 1)} cm")
+                                            print("🔍" * 20 + "\n")
+                                            # =======================================================
+
                                             # 📦 提取这整个盒子的所有点，计算几何中心
                                             box_indices = np.where(scene_mapper.object_labels == box_id)[0]
                                             box_points = np.asarray(scene_mapper.objects_pcd.points)[box_indices]
@@ -1574,48 +1603,170 @@ def main():
                                             print(f"\n 🎉 成功吸附！目标锁定为 [盒子 {box_id}]")
                                             print(f" 🎯 盒子几何中心坐标: {np.round(box_center, 3)}")
                                             
+                                            # # =======================================================
+                                            # # 智能匹配：在 AI 预测的多个抓取位姿中，选出一个距离盒子中心最近的唯一最优姿态！
+                                            # # =======================================================
+                                            # if hasattr(scene_mapper, 'ai_grasps') and scene_mapper.ai_grasps is not None and len(scene_mapper.ai_grasps) > 0:
+                                            #     min_grasp_dist = float('inf')
+                                            #     closest_grasp = None
+                                            #     closest_idx = -1
+                                                
+                                            #     # 遍历 4060 传回来并转好基座系的所有 4x4 抓取矩阵
+                                            #     for idx_g, grasp_matrix in enumerate(scene_mapper.ai_grasps):
+                                            #         # 提取矩阵中前 3 行第 4 列的 [X, Y, Z] 空间平移坐标
+                                            #         grasp_xyz = grasp_matrix[:3, 3]
+                                                    
+                                            #         # 计算该抓取点到当前凝聚盒子中心的欧氏距离
+                                            #         dist = np.linalg.norm(grasp_xyz - box_center)
+                                                    
+                                            #         if dist < min_grasp_dist:
+                                            #             min_grasp_dist = dist
+                                            #             closest_grasp = grasp_matrix
+                                            #             closest_idx = idx_g
+                                                
+                                            #     # 🌟 在这里！锁定唯一解后，立刻进行工具层面的“局部微调”
+                                            #     if closest_grasp is not None:
+                                            #         # 1. 绕局部 Z 轴自转 90 度
+                                            #         Rz_90 = np.array([
+                                            #             [ 0.0, -1.0,  0.0,  0.0],
+                                            #             [ 1.0,  0.0,  0.0,  0.0],
+                                            #             [ 0.0,  0.0,  1.0,  0.0],
+                                            #             [ 0.0,  0.0,  0.0,  1.0]
+                                            #         ])
+                                            #         tuned_grasp = closest_grasp @ Rz_90
+                                                    
+                                            #         # 2. 如果需要，还可以顺便把深度下探也叠加上去（选填）
+                                            #         # local_advance = np.eye(4)
+                                            #         # local_advance[2, 3] = 0.018 # 向前推进 1.8 厘米
+                                            #         # tuned_grasp = tuned_grasp @ local_advance
+                                                    
+                                            #         # 最终成型，挂载到 selected_grasp 上
+                                            #         scene_mapper.selected_grasp = tuned_grasp
+                                                    
+                                            #     else:
+                                            #         scene_mapper.selected_grasp = None
+                                            #     # 将筛选出的唯一最优姿态保存至 scene_mapper 供下一步使用
+
+                                            #     print(f"🎯 [智能匹配] 成功锁定最佳抓取位姿！")
+                                            #     print(f"   👉 抓取索引: {closest_idx} / {len(scene_mapper.ai_grasps)}")
+                                            #     print(f"   👉 距离物品中心: {np.round(min_grasp_dist, 3)} 米")
+                                                
+                                            # else:
+                                            #     print("⚠️ [警告] 内存中未检测到 AI 的抓取姿态列表 (scene_mapper.ai_grasps 为空)！")
+                                            #     scene_mapper.selected_grasp = None
+                                            # # ==============================
+
                                             # =======================================================
-                                            # 智能匹配：在 AI 预测的多个抓取位姿中，选出一个距离盒子中心最近的唯一最优姿态！
+                                            # 🪐【重构核心】探针投影 + 垂直度评分 + 45°校准 + 4cm深插 + 180°抄近道
                                             # =======================================================
                                             if hasattr(scene_mapper, 'ai_grasps') and scene_mapper.ai_grasps is not None and len(scene_mapper.ai_grasps) > 0:
-                                                min_grasp_dist = float('inf')
-                                                closest_grasp = None
-                                                closest_idx = -1
                                                 
-                                                # 遍历 4060 传回来并转好基座系的所有 4x4 抓取矩阵
-                                                for idx_g, grasp_matrix in enumerate(scene_mapper.ai_grasps):
-                                                    # 提取矩阵中前 3 行第 4 列的 [X, Y, Z] 空间平移坐标
+                                                CANDIDATE_POOL_LIMIT = 40 
+                                                selected_grasp = None
+                                                selected_idx = -1
+                                                
+                                                # 🌟 核心参数设置
+                                                PROJECTION_DEPTH = 0.15      # 你的 15cm 探针投影深度
+                                                BEST_COMBINED_SCORE = -1.0   # 综合评分，越高越好
+                                                
+                                                # 3. 遍历高分精英池
+                                                for idx_g, grasp_matrix in enumerate(scene_mapper.ai_grasps[:CANDIDATE_POOL_LIMIT]):
                                                     grasp_xyz = grasp_matrix[:3, 3]
+                                                    approach_vector = grasp_matrix[:3, 2] # 提取夹爪局部 +Z 轴
                                                     
-                                                    # 计算该抓取点到当前凝聚盒子中心的欧氏距离
-                                                    dist = np.linalg.norm(grasp_xyz - box_center)
+                                                    # A. 🚀 计算【你的探针距离分数】
+                                                    projected_xyz = grasp_xyz + PROJECTION_DEPTH * approach_vector
+                                                    dist_to_center = np.linalg.norm(projected_xyz - box_center)
                                                     
-                                                    if dist < min_grasp_dist:
-                                                        min_grasp_dist = dist
-                                                        closest_grasp = grasp_matrix
-                                                        closest_idx = idx_g
+                                                    # 如果探针射得太偏（比如偏离中心 15 厘米以上），直接一票否决
+                                                    if dist_to_center > 0.15:
+                                                        continue
+                                                        
+                                                    # B. 📐 计算【倾斜度/垂直度分数】
+                                                    # 机器人基座坐标系下，绝对垂直朝下的标准矢量是 [0, 0, -1]
+                                                    # 通过点积计算夹爪 Z 轴与绝对向下的贴合度。数值越接近 1.0，说明越笔直朝下！
+                                                    downward_vector = np.array([0.0, 0.0, -1.0])
+                                                    tilt_alignment = np.dot(approach_vector, downward_vector)
+                                                    
+                                                    # 确保 tilt_alignment 在 [-1, 1] 之间（防止浮点数溢出）
+                                                    tilt_alignment = np.clip(tilt_alignment, -1.0, 1.0)
+                                                    
+                                                    # 物理意义：如果夹爪倾斜度太夸张（比如和垂直方向夹角大于 50 度，即对齐度小于 0.64），直接淘汰
+                                                    if tilt_alignment < 0.64:
+                                                        continue
+                                                        
+                                                    # C. 🏆 综合双标大评分（多目标优化）
+                                                    # 距离项：1.0 - (dist / 0.15)，距离越近越趋近于 1.0
+                                                    # 垂直项：tilt_alignment，越垂直越趋近于 1.0
+                                                    # 权重分配：0.4 给距离，0.6 给垂直度（你可以根据实际效果微调权重）
+                                                    distance_score = 1.0 - (dist_to_center / 0.15)
+                                                    combined_score = 0.6 * distance_score + 0.4 * tilt_alignment
+                                                    
+                                                    # 寻找全场最符合人类审美（又准又直）的最高分天选姿态
+                                                    if combined_score > BEST_COMBINED_SCORE:
+                                                        BEST_COMBINED_SCORE = combined_score
+                                                        selected_grasp = grasp_matrix
+                                                        selected_idx = idx_g
+                                                        saved_dist = dist_to_center
+                                                        saved_tilt = tilt_alignment
                                                 
-                                                # 将筛选出的唯一最优姿态保存至 scene_mapper 供下一步使用
-                                                scene_mapper.selected_grasp = closest_grasp
-                                                print(f"🎯 [智能匹配] 成功锁定最佳抓取位姿！")
-                                                print(f"   👉 抓取索引: {closest_idx} / {len(scene_mapper.ai_grasps)}")
-                                                print(f"   👉 距离物品中心: {np.round(min_grasp_dist, 3)} 米")
+                                                if selected_grasp is not None:
+                                                    # 4. 注入 45 度自转矩阵（对准物理夹爪）
+                                                    Rz_45 = np.array([
+                                                        [ 0.7071,  0.7071,  0.0,  0.0],
+                                                        [-0.7071,  0.7071,  0.0,  0.0],
+                                                        [ 0.0,     0.0,     1.0,  0.0],
+                                                        [ 0.0,     0.0,     0.0,  1.0]
+                                                    ])
+                                                    tuned_grasp = selected_grasp @ Rz_45
+                                                    
+                                                    # 5. 注入 4 厘米硬核深插下探（消灭虚抓）
+                                                    local_advance = np.eye(4)
+                                                    local_advance[2, 3] = 0.070 
+                                                    tuned_grasp = tuned_grasp @ local_advance
+                                                    
+                                                    # =======================================================
+                                                    # 🌟 夹爪对称性优化 (180° 抄近道算法)
+                                                    # =======================================================
+                                                    ee_pos_temp, ee_quat_temp = robot_listener.get_current_pose()
+                                                    from scipy.spatial.transform import Rotation as Rot
+                                                    R_curr = Rot.from_quat(ee_quat_temp).as_matrix()
+                                                    
+                                                    R_target1 = tuned_grasp[:3, :3]
+                                                    Rz_180 = np.array([
+                                                        [-1.0,  0.0,  0.0],
+                                                        [ 0.0, -1.0,  0.0],
+                                                        [ 0.0,  0.0,  1.0]
+                                                    ])
+                                                    R_target2 = R_target1 @ Rz_180
+                                                    
+                                                    trace1 = np.trace(R_curr.T @ R_target1)
+                                                    trace2 = np.trace(R_curr.T @ R_target2)
+                                                    
+                                                    if trace2 > trace1:
+                                                        print("💡 [优化] 触发夹爪对称性：已自动翻转 180°，为您节省大量冗余旋转！")
+                                                        tuned_grasp[:3, :3] = R_target2
+                                                    # =======================================================
+
+                                                    # 6. 最终安全挂载
+                                                    scene_mapper.selected_grasp = tuned_grasp
+                                                    
+                                                    # 算出实际倾斜角度，打印出来看着爽
+                                                    tilt_angle_deg = np.degrees(np.arccos(saved_tilt))
+                                                    print(f"🎉 [多目标优选成功] 成功锁定又准又直的黄金抓取姿态！")
+                                                    print(f"   👉 选中的 AI 原始索引: {selected_idx}")
+                                                    print(f"   👉 探针直击偏差: {np.round(saved_dist * 100, 1)} cm")
+                                                    print(f"   👉 夹爪倾斜角度: {np.round(tilt_angle_deg, 1)} ° (0.0°代表完美垂直)")
+                                                    print(f"   👉 综合完美指数: {np.round(BEST_COMBINED_SCORE * 100, 1)} / 100")
+                                                else:
+                                                    print(f"⚠️ [未匹配] 精英池里挑了一圈，所有的姿态不是射偏就是太歪，未录用任何抓取！")
+                                                    scene_mapper.selected_grasp = None
                                             else:
-                                                print("⚠️ [警告] 内存中未检测到 AI 的抓取姿态列表 (scene_mapper.ai_grasps 为空)！")
+                                                print("⚠️ [警告] 内存中未检测到 AI 抓取列表！")
                                                 scene_mapper.selected_grasp = None
                                             # =======================================================
-                                            # if T_M is not None:
-                                            #     try:
-                                            #         print("box position sent to unity")
-                                            #         u_target = rut.robot2unity_transform(box_center, T_M)
-                                            #         packet = b't' + struct.pack('<fff', u_target[0], u_target[1], u_target[2])
-                                            #         conn.sendall(packet)
-                                            #         time.sleep(0.01)
-                                            #     except Exception:
-                                            #         pass
-                                            
+
                                             scene_mapper.target_box_points = box_points
-                                            
                                             current_hri_state = STATE_GRAB_OBJECT 
                                             hri_start_time = 0.0
                                             
@@ -1737,70 +1888,73 @@ def main():
                     
                     if hri_start_time == 0.0:
                         print("\n" + "="*50)
-                        print("🦾 [HRI] 状态 5: 开始执行眼动过滤后的全新 AI 6-DoF 抓取...")
+                        print("🦾 [HRI] 状态 5: 开始执行【沿局部 Z 轴斜向直插】高阶控制流...")
                         
-                        # 🌟 1. 核心提取：检查眼动阶段是否成功截获了唯一的最佳抓取矩阵
                         if hasattr(scene_mapper, 'selected_grasp') and scene_mapper.selected_grasp is not None:
+                            # 拿到经过 45°自转、180°抄近道以及 4cm深插修正后的最终黄金抓取矩阵
                             grasp_matrix = scene_mapper.selected_grasp
                             
-                            # 从 4x4 矩阵中直接提取 3D 精准目标位置 [X, Y, Z]
-                            center_x, center_y, target_z = grasp_matrix[:3, 3]
+                            # 🌟 1. 【核心改变】利用矩阵右乘数学，在工具坐标系下反向后退 15 厘米，算出轴线悬停点
+                            # 后退 15 厘米相当于在局部 Z 轴平移项注入 -0.15
+                            HOVER_BACK_DIST = 0.15
+                            local_retreat = np.eye(4)
+                            local_retreat[2, 3] = -HOVER_BACK_DIST
                             
-                            # 使用 scipy 将 3x3 旋转矩阵转换为机械臂所需要的四元数格式 [qx, qy, qz, qw]
+                            # 右乘得到悬停矩阵
+                            hover_matrix = grasp_matrix @ local_retreat
+                            
+                            # 🌟 2. 提取悬停点的 3D 位置与四元数姿态
+                            hover_x, hover_y, hover_z = hover_matrix[:3, 3]
                             from scipy.spatial.transform import Rotation as Rot
-                            grasp_rot_mat = grasp_matrix[:3, :3]
-                            grasp_quat = Rot.from_matrix(grasp_rot_mat).as_quat().tolist()
+                            hover_quat = Rot.from_matrix(hover_matrix[:3, :3]).as_quat().tolist()
                             
-                            print(f"   🧠 [AI 姿态激活] 坐标与角度已完全对齐神经网络输出！")
-                            print(f"      📍 目标位置: X={center_x:.3f}, Y={center_y:.3f}, Z={target_z:.3f}")
-                            print(f"      🔄 真实姿态四元数: {np.round(grasp_quat, 3)}")
-                        
+                            # 挂载到全局变量
+                            scene_mapper.hover_pose = [hover_x, hover_y, hover_z] + hover_quat
+                            
+                            # 记录我们要顺着轴线直插前进的总距离（悬停后退了多少，下探就要前进多少）
+                            scene_mapper.local_stroke = HOVER_BACK_DIST
+                            
+                            print(f"   🚀 [轴线悬停生成] 夹爪已顺着斜向角度后退 {HOVER_BACK_DIST*100}cm 设立炮台")
+                            print(f"      📍 悬停点位置: X={hover_x:.3f}, Y={hover_y:.3f}, Z={hover_z:.3f}")
                         else:
-                            # 🚨 安全降级备用：如果发生了意外丢失，自动回退到你的经典 OBB 方案
-                            print("⚠️ [警告] 未能找到眼动筛选的 selected_grasp，自动降级为传统 OBB 启发式抓取...")
-                            box_pcd = o3d.geometry.PointCloud()
-                            box_pcd.points = o3d.utility.Vector3dVector(scene_mapper.target_box_points)
-                            obb = box_pcd.get_oriented_bounding_box()
-                            center_x, center_y, _ = obb.center
-                            box_top_z = np.max(scene_mapper.target_box_points[:, 2])
-                            target_z = box_top_z - (-0.02) 
-                            grasp_quat = [-0.92, 0.38, -0.01, -0.00] # 固定的垂直朝下姿态
+                            print("🚨 [错误] 未找到有效的 selected_grasp！")
+                            current_hri_state = STATE_GAZE_INTERSECTION
+                            continue
                         
-                        # 🌟 2. 生成全新三段式航点
-                        # 姿态部分统一采用 AI 预测的真实旋转姿态(grasp_quat)
-                        # 悬停点与提拉点继续保持世界坐标系 Z 轴垂直升降，这是最安全的防碰撞策略！
-                        scene_mapper.hover_pose = [center_x, center_y, target_z + 0.15] + grasp_quat # 悬停点
-                        scene_mapper.grasp_pose = [center_x, center_y, target_z]        + grasp_quat # 真实抓取点
-                        scene_mapper.lift_pose  = [center_x, center_y, target_z + 0.20] + grasp_quat # 提拉点
-                        
-                        # 3. 立刻派发第一阶段：飞往悬停点
-                        print("   -> 🛫 阶段 1：飞往目标正上方悬停...")
+                        # 3. 立刻派发第一阶段：飞往斜上方悬停点
+                        print("   -> 🛫 阶段 1：飞往斜上方轴线悬停点...")
                         if robot is not None:
                             robot.move_to(scene_mapper.hover_pose, speed=0.03) 
                             
-                        scene_mapper.grasp_step = 1       # 控制抓取阶段的变量
+                        scene_mapper.grasp_step = 1       
                         hri_start_time = time.time()
                         
                     else:
-                        # 获取机械臂动作是否执行完毕（保持你原有的安全队列判定）
                         is_robot_idle = robot.path_queue.empty() if robot is not None else True
 
                         # -----------------------------------
-                        # 阶段 2：飞到上方后，张开夹爪，然后缓慢下探
+                        # 阶段 2：手腕完全转正对齐后，张开夹爪，沿局部 Z 轴斜向直插
                         # -----------------------------------
-                        if getattr(scene_mapper, 'grasp_step', 0) == 1 and time.time() - hri_start_time > 1.0 and is_robot_idle:
-                            if robot is not None:
-                                robot.open_gripper(width=0.08) # 张开 8 厘米
-                                
-                            print("   -> 🛬 阶段 2：夹爪已张开，开始直线缓慢下压...")
-                            if robot is not None:
-                                robot.move_to(scene_mapper.grasp_pose, speed=0.02) 
-                                
-                            scene_mapper.grasp_step = 2
-                            hri_start_time = time.time()
+                        if getattr(scene_mapper, 'grasp_step', 0) == 1 and time.time() - hri_start_time > 1.0:
                             
+                            # 二次硬对齐检查：手腕角度必须锁死到目标悬停姿态
+                            target_quat = scene_mapper.hover_pose[3:7]
+                            is_rotation_ok = robot.is_rotation_reached(target_quat, tolerance_deg=1.5)
+                            
+                            if is_robot_idle and is_rotation_ok:
+                                if robot is not None:
+                                    robot.open_gripper(width=0.08) # 张开夹爪
+                                    
+                                print(f"   -> 🛬 阶段 2：[姿态死锁] 开始顺着夹爪局部 Z 轴斜向直插 {scene_mapper.local_stroke*100:.1f}cm...")
+                                if robot is not None:
+                                    # 🌟 核心调用：顺着指尖方向向前开火推进！
+                                    robot.move_along_local_z(stroke_distance=scene_mapper.local_stroke, speed=0.015) 
+                                    
+                                scene_mapper.grasp_step = 2
+                                hri_start_time = time.time()
+                                
                         # -----------------------------------
-                        # 阶段 3：到达底部，闭合夹爪
+                        # 阶段 3：到达底部，闭合夹爪 (保持你原有代码不变)
                         # -----------------------------------
                         elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 1.5 and is_robot_idle:
                             print("   -> ✊ 阶段 3：接触目标，正在闭合夹爪...")
@@ -1811,18 +1965,23 @@ def main():
                             hri_start_time = time.time()
                             
                         # -----------------------------------
-                        # 阶段 4：抓稳后，向上提拉
+                        # 阶段 4：抓稳后，垂直向上提拉 (为了安全退出，提拉依旧建议走纯世界系 Z 轴垂直向上)
                         # -----------------------------------
                         elif getattr(scene_mapper, 'grasp_step', 0) == 3 and time.time() - hri_start_time > 0.5: 
-                            print("   -> 🚀 阶段 4：提拉物品...")
-                            if robot is not None:
-                                robot.move_to(scene_mapper.lift_pose, speed=0.05) 
+                            print("   -> 🚀 阶段 4：垂直向上提拉物品，退出障碍区...")
+                            
+                            # 临时算一个世界坐标系正上方的提拉点
+                            curr_p, curr_r = robot.get_current_pose()
+                            if curr_p is not None:
+                                scene_mapper.lift_pose = [curr_p[0], curr_p[1], curr_p[2] + 0.18] + curr_r.tolist()
+                                if robot is not None:
+                                    robot.move_to(scene_mapper.lift_pose, speed=0.04) 
                                 
                             scene_mapper.grasp_step = 4
                             hri_start_time = time.time()
                             
                         # -----------------------------------
-                        # 任务完成，重置状态
+                        # 任务完成
                         # -----------------------------------
                         elif getattr(scene_mapper, 'grasp_step', 0) == 4 and time.time() - hri_start_time > 1.0 and is_robot_idle:
                             print("\n🎉 [HRI] Grab success! Passing the object to user")
@@ -1964,51 +2123,72 @@ def main():
                     # =========================================================
                     if getattr(scene_mapper, 'pass_step', 0) == 0:
                         if global_holo_hand_pos is not None:
-                            ee_pos, ee_quat = robot_listener.get_current_pose() # 🌟 确保获取 ee_quat
                             
-                            if ee_pos is not None:
-                                final_target_pos = global_holo_hand_pos + np.array([0, 0, 0.25]) 
-                                vec_to_target = final_target_pos - np.array(ee_pos)
-                                dist_to_target = np.linalg.norm(vec_to_target)
+                            # 🌟 新增：工作空间边界安全保护 (安全电子围栏)
+                            dist_to_base = np.linalg.norm(global_holo_hand_pos)
+                            SAFE_RADIUS = 1.05 # 比 State 6 的触发半径(1.0m)稍大，形成迟滞区间，防止边缘反复横跳
+                            
+                            if dist_to_base > SAFE_RADIUS:
+                                # 如果手超出了范围，且机械臂还在伺服，立刻刹停
+                                if robot is not None and getattr(robot, 'is_servoing', False):
+                                    print(f"⚠️ [HRI] 手掌超出安全工作空间 ({dist_to_base:.2f}m > {SAFE_RADIUS}m)！暂停追踪。")
+                                    robot.stop_servoing()
+                                    handover_dwell_start = 0.0 # 读秒清零
+                                    if T_M is not None:
+                                        send_path_to_hololens(conn, [], T_M) # 清空 HoloLens 连线
+                                        
+                            else:
+                                # 如果之前被暂停了，现在手又乖乖回到安全范围内了，恢复追踪！
+                                if robot is not None and not getattr(robot, 'is_servoing', False):
+                                    print(f"✅ [HRI] 手掌回到安全范围 ({dist_to_base:.2f}m)，恢复伺服追踪！")
+                                    robot.start_servoing()
+                                    
+                                ee_pos, ee_quat = robot_listener.get_current_pose() # 🌟 确保获取 ee_quat
                                 
-                                if robot is not None:
-                                    robot.update_servo_target(final_target_pos)
-                                
-                                if T_M is not None and (time.time() - last_ray_print_time > 0.1):
-                                    full_visual_path = []
-                                    num_visual_points = 10
-                                    for i in range(num_visual_points + 1):
-                                        ratio = i / float(num_visual_points)
-                                        pt = np.array(ee_pos) + ratio * vec_to_target
-                                        full_visual_path.append(pt)
-                                    send_path_to_hololens(conn, full_visual_path, T_M)
-                                    last_ray_print_time = time.time()
+                                if ee_pos is not None:
+                                    final_target_pos = global_holo_hand_pos + np.array([0, 0, 0.25]) 
+                                    vec_to_target = final_target_pos - np.array(ee_pos)
+                                    dist_to_target = np.linalg.norm(vec_to_target)
+                                    
+                                    if robot is not None:
+                                        robot.update_servo_target(final_target_pos)
+                                    
+                                    if T_M is not None and (time.time() - last_ray_print_time > 0.1):
+                                        full_visual_path = []
+                                        num_visual_points = 10
+                                        for i in range(num_visual_points + 1):
+                                            ratio = i / float(num_visual_points)
+                                            pt = np.array(ee_pos) + ratio * vec_to_target
+                                            full_visual_path.append(pt)
+                                        send_path_to_hololens(conn, full_visual_path, T_M)
+                                        last_ray_print_time = time.time()
 
-                                # 带迟滞区间的防抖读秒
-                                if handover_dwell_start == 0.0:
-                                    if dist_to_target < 0.06:
-                                        handover_dwell_start = time.time()
-                                        print("⏳ [HRI] 机械臂已就位，请保持手部稳定 1 秒钟...")
-                                else:
-                                    if dist_to_target > 0.10:
-                                        print("⚠️ [HRI] 目标大幅移动，打断稳定计时，重新追踪...")
-                                        handover_dwell_start = 0.0
-                                        
-                                    elif time.time() - handover_dwell_start >= 0.5:
-                                        print("⬇️ [HRI] 追踪稳定！停止伺服，开始缓慢下降并检测触碰...")
-                                        
-                                        if robot is not None:
-                                            robot.stop_servoing() 
+                                    # 带迟滞区间的防抖读秒
+                                    if handover_dwell_start == 0.0:
+                                        if dist_to_target < 0.06:
+                                            handover_dwell_start = time.time()
+                                            print("⏳ [HRI] 机械臂已就位，请保持手部稳定 1 秒钟...")
+                                    else:
+                                        if dist_to_target > 0.10:
+                                            print("⚠️ [HRI] 目标大幅移动，打断稳定计时，重新追踪...")
+                                            handover_dwell_start = 0.0
                                             
-                                        # 🌟【核心修复】：将 3维位置 与 4维姿态 拼装成 7维 Pose 列表
-                                        descend_target_p = np.array(ee_pos) - np.array([0, 0, 0.20])
-                                        descend_full_pose = list(descend_target_p) + list(ee_quat)
-                                        
-                                        if robot is not None:
-                                            robot.move_to(descend_full_pose, speed=0.03)
-                                        
-                                        scene_mapper.pass_step = 1
-                                        
+                                        elif time.time() - handover_dwell_start >= 0.5:
+                                            print("⬇️ [HRI] 追踪稳定！停止伺服，开始缓慢下降并检测触碰...")
+                                            
+                                            if robot is not None:
+                                                robot.stop_servoing() 
+                                                
+                                            # 🌟【核心修复】：将 3维位置 与 4维姿态 拼装成 7维 Pose 列表
+                                            descend_target_p = np.array(ee_pos) - np.array([0, 0, 0.20])
+                                            descend_full_pose = list(descend_target_p) + list(ee_quat)
+                                            
+                                            if robot is not None:
+                                                robot.move_to(descend_full_pose, speed=0.03)
+                                            
+                                            scene_mapper.pass_step = 1
+
+
                     # =========================================================
                     # 阶段 1：缓慢下降，同时高频检测 Z 轴受力 (修复起步惯性误触)
                     # =========================================================
