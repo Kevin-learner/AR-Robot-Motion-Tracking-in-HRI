@@ -1574,6 +1574,36 @@ def main():
                                             print(f"\n 🎉 成功吸附！目标锁定为 [盒子 {box_id}]")
                                             print(f" 🎯 盒子几何中心坐标: {np.round(box_center, 3)}")
                                             
+                                            # =======================================================
+                                            # 智能匹配：在 AI 预测的多个抓取位姿中，选出一个距离盒子中心最近的唯一最优姿态！
+                                            # =======================================================
+                                            if hasattr(scene_mapper, 'ai_grasps') and scene_mapper.ai_grasps is not None and len(scene_mapper.ai_grasps) > 0:
+                                                min_grasp_dist = float('inf')
+                                                closest_grasp = None
+                                                closest_idx = -1
+                                                
+                                                # 遍历 4060 传回来并转好基座系的所有 4x4 抓取矩阵
+                                                for idx_g, grasp_matrix in enumerate(scene_mapper.ai_grasps):
+                                                    # 提取矩阵中前 3 行第 4 列的 [X, Y, Z] 空间平移坐标
+                                                    grasp_xyz = grasp_matrix[:3, 3]
+                                                    
+                                                    # 计算该抓取点到当前凝聚盒子中心的欧氏距离
+                                                    dist = np.linalg.norm(grasp_xyz - box_center)
+                                                    
+                                                    if dist < min_grasp_dist:
+                                                        min_grasp_dist = dist
+                                                        closest_grasp = grasp_matrix
+                                                        closest_idx = idx_g
+                                                
+                                                # 将筛选出的唯一最优姿态保存至 scene_mapper 供下一步使用
+                                                scene_mapper.selected_grasp = closest_grasp
+                                                print(f"🎯 [智能匹配] 成功锁定最佳抓取位姿！")
+                                                print(f"   👉 抓取索引: {closest_idx} / {len(scene_mapper.ai_grasps)}")
+                                                print(f"   👉 距离物品中心: {np.round(min_grasp_dist, 3)} 米")
+                                            else:
+                                                print("⚠️ [警告] 内存中未检测到 AI 的抓取姿态列表 (scene_mapper.ai_grasps 为空)！")
+                                                scene_mapper.selected_grasp = None
+                                            # =======================================================
                                             # if T_M is not None:
                                             #     try:
                                             #         print("box position sent to unity")
@@ -1600,44 +1630,151 @@ def main():
                             fixation_point = None
                             fixation_start_time = 0.0
 
+                # # -----------------------------------
+                # # 状态 5：高精度纯几何抓取 (Kinematic Grasp)
+                # # -----------------------------------
+                # elif current_hri_state == STATE_GRAB_OBJECT:
+                    
+                #     if hri_start_time == 0.0:
+                #         print("\n" + "="*50)
+                #         print("🦾 [HRI] 状态 5: 开始执行纯视觉几何抓取...")
+                        
+                #         # 1. 获取目标盒子点云，计算 OBB 包围盒
+                #         box_pcd = o3d.geometry.PointCloud()
+                #         box_pcd.points = o3d.utility.Vector3dVector(scene_mapper.target_box_points)
+                #         obb = box_pcd.get_oriented_bounding_box()
+                        
+                #         # 2. 🌟 降维打击计算坐标：X/Y 相信 OBB，Z 相信桌面！
+                #         center_x, center_y, _ = obb.center
+                        
+                #         # 盒子的最高点 Z (结合桌面高度，算出真实的物理最高点)
+                #         box_top_z = np.max(scene_mapper.target_box_points[:, 2])
+                #         box_actual_height = box_top_z - getattr(scene_mapper, 'table_z', 0.0)
+                        
+                #         # 设定抓取点 (比如从盒子最高点往下探 2 厘米)
+                #         GRASP_DEPTH = -0.02
+                #         target_z = box_top_z - GRASP_DEPTH
+                        
+                #         print(f"   📦 目标中心: X={center_x:.3f}, Y={center_y:.3f}")
+                #         print(f"   📏 目标高度: {box_actual_height*100:.1f} cm (抓取深度 Z={target_z:.3f})")
+                        
+                #         # 3. 定义夹爪朝下的固定四元数 (请替换为你实际夹爪垂直朝下的位姿！)
+                #         GRASP_ROT = [-0.92, 0.38, -0.01, -0.00] 
+                        
+                #         # 4. 生成三段式关键点，并安全地挂载到 scene_mapper 上！
+                #         scene_mapper.hover_pose = [center_x, center_y, target_z + 0.15] + GRASP_ROT # 悬停点
+                #         scene_mapper.grasp_pose = [center_x, center_y, target_z ] + GRASP_ROT        # 抓取点
+                #         scene_mapper.lift_pose  = [center_x, center_y, target_z + 0.20] + GRASP_ROT # 提拉点
+                        
+                #         # 5. 立刻派发第一阶段：飞往悬停点
+                #         print("   -> 🛫 阶段 1：飞往正上方悬停...")
+                #         if robot is not None:
+                #             robot.move_to(scene_mapper.hover_pose, speed=0.03) 
+                            
+                #         scene_mapper.grasp_step = 1       # 控制抓取阶段的变量
+                #         hri_start_time = time.time()
+                        
+                #     else:
+                #         # 🌟 新增：获取机械臂是否处于空闲状态 (动作是否执行完毕)
+                #         is_robot_idle = robot.path_queue.empty() if robot is not None else True
+
+                #         # -----------------------------------
+                #         # 阶段 2：飞到上方后，张开夹爪，然后缓慢下探
+                #         # -----------------------------------
+                #         # 修改条件：等待至少 1 秒（防止队列还没塞进去就误判）并且 机械臂动作已走完！
+                #         if getattr(scene_mapper, 'grasp_step', 0) == 1 and time.time() - hri_start_time > 1.0 and is_robot_idle:
+                            
+                #             # 🌟 先张开夹爪！
+                #             if robot is not None:
+                #                 robot.open_gripper(width=0.08) # 张开 8 厘米
+                                
+                #             print("   -> 🛬 阶段 2：夹爪已张开，开始直线缓慢下压...")
+                #             if robot is not None:
+                #                 robot.move_to(scene_mapper.grasp_pose, speed=0.02) 
+                                
+                #             scene_mapper.grasp_step = 2
+                #             hri_start_time = time.time()
+                            
+                #         # -----------------------------------
+                #         # 阶段 3：到达底部，闭合夹爪
+                #         # -----------------------------------
+                #         # 修改条件：下探的动作必须完全走完，才允许闭合夹爪！
+                #         elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 1.5 and is_robot_idle:
+                #             print("   -> ✊ 阶段 3：接触目标，正在闭合夹爪...")
+                            
+                #             # 🌟 抓紧盒子！
+                #             if robot is not None:
+                #                 robot.close_gripper(force=15.0, speed=0.05) # 施加 30N 的抓取力
+                            
+                #             scene_mapper.grasp_step = 3
+                #             hri_start_time = time.time()
+                            
+                #         # -----------------------------------
+                #         # 阶段 4：抓稳后，向上提拉
+                #         # -----------------------------------
+                #         # 这个阶段不用等 is_robot_idle，因为夹爪闭合(close_gripper)本身有 sleep(1.5) 阻塞，
+                #         # 当代码走到这里时，夹爪肯定已经闭合完毕了。
+                #         elif getattr(scene_mapper, 'grasp_step', 0) == 3 and time.time() - hri_start_time > 0.5: 
+                #             print("   -> 🚀 阶段 4：提拉物品...")
+                #             if robot is not None:
+                #                 robot.move_to(scene_mapper.lift_pose, speed=0.05) # 提拉稍微快一点点
+                                
+                #             scene_mapper.grasp_step = 4
+                #             hri_start_time = time.time()
+                            
+                #         # -----------------------------------
+                #         # 任务完成，重置状态
+                #         # -----------------------------------
+                #         elif getattr(scene_mapper, 'grasp_step', 0) == 4 and time.time() - hri_start_time > 1.0 and is_robot_idle:
+                #             print("\n🎉 [HRI] Grab success! Passing the object to user")
+                #             current_hri_state = STATE_LOOKING_FOR_USER
+                #             hri_start_time = 0.0
+                
                 # -----------------------------------
-                # 状态 5：高精度纯几何抓取 (Kinematic Grasp)
+                # 状态 5：高精度 6-DoF AI 神经网络抓取 (Selected AI Grasp)
                 # -----------------------------------
                 elif current_hri_state == STATE_GRAB_OBJECT:
                     
                     if hri_start_time == 0.0:
                         print("\n" + "="*50)
-                        print("🦾 [HRI] 状态 5: 开始执行纯视觉几何抓取...")
+                        print("🦾 [HRI] 状态 5: 开始执行眼动过滤后的全新 AI 6-DoF 抓取...")
                         
-                        # 1. 获取目标盒子点云，计算 OBB 包围盒
-                        box_pcd = o3d.geometry.PointCloud()
-                        box_pcd.points = o3d.utility.Vector3dVector(scene_mapper.target_box_points)
-                        obb = box_pcd.get_oriented_bounding_box()
+                        # 🌟 1. 核心提取：检查眼动阶段是否成功截获了唯一的最佳抓取矩阵
+                        if hasattr(scene_mapper, 'selected_grasp') and scene_mapper.selected_grasp is not None:
+                            grasp_matrix = scene_mapper.selected_grasp
+                            
+                            # 从 4x4 矩阵中直接提取 3D 精准目标位置 [X, Y, Z]
+                            center_x, center_y, target_z = grasp_matrix[:3, 3]
+                            
+                            # 使用 scipy 将 3x3 旋转矩阵转换为机械臂所需要的四元数格式 [qx, qy, qz, qw]
+                            from scipy.spatial.transform import Rotation as Rot
+                            grasp_rot_mat = grasp_matrix[:3, :3]
+                            grasp_quat = Rot.from_matrix(grasp_rot_mat).as_quat().tolist()
+                            
+                            print(f"   🧠 [AI 姿态激活] 坐标与角度已完全对齐神经网络输出！")
+                            print(f"      📍 目标位置: X={center_x:.3f}, Y={center_y:.3f}, Z={target_z:.3f}")
+                            print(f"      🔄 真实姿态四元数: {np.round(grasp_quat, 3)}")
                         
-                        # 2. 🌟 降维打击计算坐标：X/Y 相信 OBB，Z 相信桌面！
-                        center_x, center_y, _ = obb.center
+                        else:
+                            # 🚨 安全降级备用：如果发生了意外丢失，自动回退到你的经典 OBB 方案
+                            print("⚠️ [警告] 未能找到眼动筛选的 selected_grasp，自动降级为传统 OBB 启发式抓取...")
+                            box_pcd = o3d.geometry.PointCloud()
+                            box_pcd.points = o3d.utility.Vector3dVector(scene_mapper.target_box_points)
+                            obb = box_pcd.get_oriented_bounding_box()
+                            center_x, center_y, _ = obb.center
+                            box_top_z = np.max(scene_mapper.target_box_points[:, 2])
+                            target_z = box_top_z - (-0.02) 
+                            grasp_quat = [-0.92, 0.38, -0.01, -0.00] # 固定的垂直朝下姿态
                         
-                        # 盒子的最高点 Z (结合桌面高度，算出真实的物理最高点)
-                        box_top_z = np.max(scene_mapper.target_box_points[:, 2])
-                        box_actual_height = box_top_z - getattr(scene_mapper, 'table_z', 0.0)
+                        # 🌟 2. 生成全新三段式航点
+                        # 姿态部分统一采用 AI 预测的真实旋转姿态(grasp_quat)
+                        # 悬停点与提拉点继续保持世界坐标系 Z 轴垂直升降，这是最安全的防碰撞策略！
+                        scene_mapper.hover_pose = [center_x, center_y, target_z + 0.15] + grasp_quat # 悬停点
+                        scene_mapper.grasp_pose = [center_x, center_y, target_z]        + grasp_quat # 真实抓取点
+                        scene_mapper.lift_pose  = [center_x, center_y, target_z + 0.20] + grasp_quat # 提拉点
                         
-                        # 设定抓取点 (比如从盒子最高点往下探 2 厘米)
-                        GRASP_DEPTH = -0.02
-                        target_z = box_top_z - GRASP_DEPTH
-                        
-                        print(f"   📦 目标中心: X={center_x:.3f}, Y={center_y:.3f}")
-                        print(f"   📏 目标高度: {box_actual_height*100:.1f} cm (抓取深度 Z={target_z:.3f})")
-                        
-                        # 3. 定义夹爪朝下的固定四元数 (请替换为你实际夹爪垂直朝下的位姿！)
-                        GRASP_ROT = [-0.92, 0.38, -0.01, -0.00] 
-                        
-                        # 4. 生成三段式关键点，并安全地挂载到 scene_mapper 上！
-                        scene_mapper.hover_pose = [center_x, center_y, target_z + 0.15] + GRASP_ROT # 悬停点
-                        scene_mapper.grasp_pose = [center_x, center_y, target_z ] + GRASP_ROT        # 抓取点
-                        scene_mapper.lift_pose  = [center_x, center_y, target_z + 0.20] + GRASP_ROT # 提拉点
-                        
-                        # 5. 立刻派发第一阶段：飞往悬停点
-                        print("   -> 🛫 阶段 1：飞往正上方悬停...")
+                        # 3. 立刻派发第一阶段：飞往悬停点
+                        print("   -> 🛫 阶段 1：飞往目标正上方悬停...")
                         if robot is not None:
                             robot.move_to(scene_mapper.hover_pose, speed=0.03) 
                             
@@ -1645,16 +1782,13 @@ def main():
                         hri_start_time = time.time()
                         
                     else:
-                        # 🌟 新增：获取机械臂是否处于空闲状态 (动作是否执行完毕)
+                        # 获取机械臂动作是否执行完毕（保持你原有的安全队列判定）
                         is_robot_idle = robot.path_queue.empty() if robot is not None else True
 
                         # -----------------------------------
                         # 阶段 2：飞到上方后，张开夹爪，然后缓慢下探
                         # -----------------------------------
-                        # 修改条件：等待至少 1 秒（防止队列还没塞进去就误判）并且 机械臂动作已走完！
                         if getattr(scene_mapper, 'grasp_step', 0) == 1 and time.time() - hri_start_time > 1.0 and is_robot_idle:
-                            
-                            # 🌟 先张开夹爪！
                             if robot is not None:
                                 robot.open_gripper(width=0.08) # 张开 8 厘米
                                 
@@ -1668,26 +1802,21 @@ def main():
                         # -----------------------------------
                         # 阶段 3：到达底部，闭合夹爪
                         # -----------------------------------
-                        # 修改条件：下探的动作必须完全走完，才允许闭合夹爪！
                         elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 1.5 and is_robot_idle:
                             print("   -> ✊ 阶段 3：接触目标，正在闭合夹爪...")
-                            
-                            # 🌟 抓紧盒子！
                             if robot is not None:
-                                robot.close_gripper(force=15.0, speed=0.05) # 施加 30N 的抓取力
-                            
+                                robot.close_gripper(force=15.0, speed=0.05) 
+                                
                             scene_mapper.grasp_step = 3
                             hri_start_time = time.time()
                             
                         # -----------------------------------
                         # 阶段 4：抓稳后，向上提拉
                         # -----------------------------------
-                        # 这个阶段不用等 is_robot_idle，因为夹爪闭合(close_gripper)本身有 sleep(1.5) 阻塞，
-                        # 当代码走到这里时，夹爪肯定已经闭合完毕了。
                         elif getattr(scene_mapper, 'grasp_step', 0) == 3 and time.time() - hri_start_time > 0.5: 
                             print("   -> 🚀 阶段 4：提拉物品...")
                             if robot is not None:
-                                robot.move_to(scene_mapper.lift_pose, speed=0.05) # 提拉稍微快一点点
+                                robot.move_to(scene_mapper.lift_pose, speed=0.05) 
                                 
                             scene_mapper.grasp_step = 4
                             hri_start_time = time.time()
@@ -1699,7 +1828,6 @@ def main():
                             print("\n🎉 [HRI] Grab success! Passing the object to user")
                             current_hri_state = STATE_LOOKING_FOR_USER
                             hri_start_time = 0.0
-
                 # # -----------------------------------
                 # # 状态 6：寻找用户 -> 确认伸手 -> 翻转为递送姿势
                 # # -----------------------------------

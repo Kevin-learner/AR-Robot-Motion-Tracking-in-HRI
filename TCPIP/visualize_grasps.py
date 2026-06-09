@@ -65,7 +65,7 @@ def create_custom_gripper_marker(color=[0, 1, 0], scale=1.0, rotate_90_z=False):
 # ==========================================
 # 主可视化逻辑 (保持干净，不做任何矩阵乘法)
 # ==========================================
-def visualize_scene(pcd_path, grasps_path, top_n=15, gripper_scale=1.5):
+def visualize_scene(pcd_path, grasps_path, top_n=15, gripper_scale=1):
     """
     gripper_scale: 此处可以修改夹爪缩放倍数
     """
