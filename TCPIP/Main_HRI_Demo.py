@@ -203,13 +203,13 @@ def send_robot_ball_position(conn, robot_raw_pos, T_M):
 
         # ==================== 调试打印区 ====================
         print("-" * 50)
-        print(f"DEBUG: 发送球坐标数据")
-        print(f"  -> 逻辑坐标 (Unity): X={unity_pos[0]:.4f}, Y={unity_pos[1]:.4f}, Z={unity_pos[2]:.4f}")
+        print(f"DEBUG: Send Robot Ball Position:")
+        print(f"  -> Coordination (Unity): X={unity_pos[0]:.4f}, Y={unity_pos[1]:.4f}, Z={unity_pos[2]:.4f}")
         
         # 打印十六进制，方便与 Unity 端逐字节比对
         # b'b' 的十六进制是 62
         hex_data = full_packet.hex(' ')
-        print(f"  -> 原始字节流 (Hex): {hex_data}")
+        print(f"  -> Original Data Stream (Hex): {hex_data}")
         print("-" * 50)
         # ===================================================
     except Exception as e:
@@ -394,6 +394,79 @@ def send_path_to_hololens(conn, points, T_M):
     except Exception as e:
         print(f"⚠️ [TCP] 发送动态路径至 HoloLens 失败: {e}")
 
+
+def send_hri_status_packet(conn, state_id, sub_state_id):
+    """
+    [升级版] 同时同步 HRI 主状态和子状态到 HoloLens
+    Header: 'I' (1 byte) + payload (8 bytes: 2个小端序 int)
+    """
+    try:
+        header = b'I'
+        # 打包两个 int：主状态 ID 和 子状态/步骤 ID
+        payload = struct.pack('<ii', state_id, sub_state_id)
+        
+        conn.setblocking(True)
+        conn.sendall(header + payload)
+        conn.setblocking(False)
+        print(f"📢 [TCP] 状态全同步 -> Main: {state_id} | Sub: {sub_state_id}")
+    except BlockingIOError:
+        pass
+    except Exception as e:
+        print(f"❌ [TCP] 同步 HRI 状态失败: {e}")
+
+
+def send_point_cloud_to_hololens(conn, pcd, T_M):
+    """
+    高性能点云发送：降采样、坐标系转换、二进制打包
+    """
+    try:
+        if pcd is None or pcd.is_empty(): return
+        
+        # 1. 体素降采样 (极其重要！设置 1cm，既能看清形状，又能把点数压缩到 1万~3万点以内)
+        downsampled_pcd = pcd.voxel_down_sample(voxel_size=0.01)
+        
+        points = np.asarray(downsampled_pcd.points)
+        # 如果有点云颜色则提取，没有就默认白色
+        colors = np.asarray(downsampled_pcd.colors) if downsampled_pcd.has_colors() else np.ones_like(points)
+        
+        num_points = len(points)
+        if num_points == 0: return
+        
+        # 2. 坐标转换 (Robot -> Unity)
+        # 因为 rut 可能没有向量化，我们用列表推导式批量转换，1万个点大概只需要几毫秒
+        unity_points = []
+        valid_indices = []
+        for i, pt in enumerate(points):
+            u_pt = rut.robot2unity_transform(pt, T_M)
+            if u_pt is not None:
+                unity_points.append(u_pt)
+                valid_indices.append(i)
+                
+        if not unity_points: return
+        
+        unity_points = np.array(unity_points, dtype=np.float32)
+        unity_colors = colors[valid_indices].astype(np.float32)
+        
+        # 3. 打包：每个点 6 个 float -> [x, y, z, r, g, b]
+        # 使用 hstack 拼接然后展平为一维数组
+        payload_data = np.hstack((unity_points, unity_colors)).flatten()
+        
+        # 4. 发送 TCP 数据包
+        header = b'C'
+        count_bytes = struct.pack('<i', len(unity_points))
+        payload_bytes = payload_data.tobytes() # 自动转为小端序的 bytes
+        
+        conn.setblocking(True)
+        conn.sendall(header + count_bytes + payload_bytes)
+        conn.setblocking(False)
+        
+        print(f"☁️ [TCP] 已向 HoloLens 发送对齐点云，总计: {len(unity_points)} 点 ({len(payload_bytes)/1024:.1f} KB)")
+        
+    except BlockingIOError:
+        pass
+    except Exception as e:
+        print(f"❌ [TCP] 发送点云失败: {e}")
+
 # -------------------------------------------------
 # 3. 主循环
 # -------------------------------------------------
@@ -434,9 +507,9 @@ def main():
     # [新增] 启动时尝试自动加载
     T_M = load_tm_matrix(TM_CACHE_PATH) 
     if T_M is not None:
-        print("🚀 [System] Ready to go without manual calibration.")
+        print(" [System] Ready to go without manual calibration.")
     else:
-        print("ℹ️ [System] No calibration cache found. Calibration required.")
+        print(" [System] No calibration cache found. Calibration required.")
 
     # ===  HRI 状态机初始化 ===
     is_HRI_Demo = False  # 是否进入 Demo 模式的总开关
@@ -453,8 +526,12 @@ def main():
     has_completed_initial_scan = False
 
     current_hri_state = STATE_IDLE
+    current_sub_state = 0  # 新增：统一的当前子状态变量
     hri_start_time = 0.0     # 记录状态切换的时间，用于非阻塞等待
     handover_dwell_start = 0.0
+
+    last_synced_state = -999
+    last_synced_sub_state = -999
     
     # 定义机械臂初始观测位姿 (请替换为你实际的关节角或笛卡尔坐标)
     INIT_POSE = [0.3572, 0.0073, 0.5586, -0.68, 0.27, -0.63, 0.26]    # 1. State Tracking 的 PID 参数 (需要调试)
@@ -549,7 +626,7 @@ def main():
                 except BlockingIOError:
                     break # 没数据，跳过
                 except Exception as e:
-                    print(f"连接异常: {e}")
+                    print(f"[TCP] Connection Error: {e}")
                     break
                 
                 if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f', 'e', 'h', 'O', 'P']:
@@ -630,7 +707,7 @@ def main():
                     # ===============================================
                     elif header == 'b':
                         if robot == None:
-                            print(">> 正在连接机器人...")
+                            print(">> Connecting to robot...")
                             robot = RobotController()
 
                         _ = recv_exact(conn, 1) # 读掉 Unity 的补位字节
@@ -675,23 +752,23 @@ def main():
                     # ===============================================
                     elif header == 'p':
                         print("\n" + "="*50)
-                        print("[TCP] 检测到 Header 'p'，开始解析位姿序列...")
+                        print("[TCP]  Header 'p' Detected, Receiving Pose Sequence...")
                         
                         # 1. 读取点数 (4字节 Int)
                         count_bytes = recv_exact(conn, 4)
                         if not count_bytes: 
-                            print("   ❌ 未收到点数数据")
+                            print("   ❌ failed to receive point count")
                             break
                         
                         num_points = struct.unpack('<i', count_bytes)[0]
-                        print(f"   -> 计划接收关键点数: {num_points}")
+                        print(f"   -> Planned Points: {num_points}")
 
                         # 2. 读取数据包 (每个点 28 字节: 3 float pos + 4 float rot)
                         bytes_per_point = 28
                         total_bytes = num_points * bytes_per_point
                         data_bytes = recv_exact(conn, total_bytes)
                         if not data_bytes: 
-                            print("   ❌ 未收到完整位姿数据")
+                            print("   ❌ failed to receive pose data")
                             break
 
                         # 3. 解析与转换数据
@@ -722,14 +799,14 @@ def main():
 
                                     # --- C. 日志打印：对比原始角度与变换后角度 ---
                                     print(f"   [{i}] ---------------------------------------")
-                                    print(f"       位置: Unity {np.round(u_pos, 2)} -> 机器人 {np.round(r_pos, 3)}")
-                                    print(f"       姿态: 原始RPY(Unity): {np.round(res['raw_rpy'], 1)}°")
-                                    print(f"       姿态: 变换RPY(Robot): {np.round(res['robot_rpy'], 1)}°")
+                                    print(f"       Position: Unity {np.round(u_pos, 2)} -> 机器人 {np.round(r_pos, 3)}")
+                                    print(f"       Orientation: Original RPY(Unity): {np.round(res['raw_rpy'], 1)}°")
+                                    print(f"       Orientation: Transformed RPY(Robot): {np.round(res['robot_rpy'], 1)}°")
                                     # 如果需要调试 XYZ 单位向量，可以打印 res['rhs_axes']
 
                             # 4. 生成带姿态插值的平滑路径
                             if len(path_with_orientations) >= 2:
-                                print(f"\n   [Interpolation] 正在生成平滑路径...")
+                                print(f"\n   [Interpolation] Generating Smooth Path...")
                                 final_smooth_path = pathInterpolation.generate_smooth_path_with_orientation(
                                     path_with_orientations, 
                                     resolution=3
@@ -740,7 +817,7 @@ def main():
                                 if robot is None: 
                                     robot = RobotController()
                                 
-                                print(f"   🚀 开始执行，总插值点数: {len(final_smooth_path)}")
+                                print(f"   🚀 Starting Execution, Total Interpolated Points: {len(final_smooth_path)}")
                                 # 发送给机械臂执行
                                 robot.execute_path(final_smooth_path, speed=0.02)
 
@@ -748,7 +825,7 @@ def main():
                                 # 假设目标点是路径的最后一个点
                                 target_pos = final_smooth_path[-1]['pos'] 
 
-                                print(" ⏳ 等待机械臂到达目标位置...")
+                                print(" ⏳ Waiting for robot to reach target position...")
                                 while True:
                                     # 获取机械臂当前的实时位置 (你可以从你的 robot_listener 获取)
                                     current_pos = robot_listener.get_position() 
@@ -765,11 +842,11 @@ def main():
 
                                 try:
                                     conn.sendall(b'm')
-                                    print("   ✅ [TCP] 机械臂运动完毕，已向 HoloLens 发送 'm' 解锁信号")
+                                    print("   ✅ [TCP] Robot motion completed, 'm' unlock signal sent to HoloLens")
                                 except Exception as e:
-                                    print(f"   ❌ 发送完成信号失败: {e}")
+                                    print(f"   ❌ Failed to send completion signal: {e}")
                         else:
-                            print("   ⚠️ T_M 矩阵为空，请先进行校准发送 'c'！")
+                            print("   ⚠️ T_M matrix is empty, please calibrate first by sending 'c'!")
                         print("="*50 + "\n")
 
                     # ===============================================
@@ -777,23 +854,23 @@ def main():
                     # ===============================================
                     elif header == 'f':
                         print("\n" + "="*50)
-                        print("[TCP] 检测到 Header 'f'，开始解析【力控】位姿序列...")
+                        print("[TCP]  Header 'f' Detected, starting to parse 【Force Control】pose sequence...")
                         
                         # 1. 读取点数 (4字节 Int)
                         count_bytes = recv_exact(conn, 4)
                         if not count_bytes: 
-                            print("   ❌ 未收到点数数据")
+                            print("   ❌ Failed to receive force control point count")
                             break
                         
                         num_points = struct.unpack('<i', count_bytes)[0]
-                        print(f"   -> 计划接收力控关键点数: {num_points}")
+                        print(f"   -> Plan to receive force control key points: {num_points}")
 
                         # 2. 读取数据包 (每个点 32 字节: 3 pos + 4 rot + 1 force)
                         bytes_per_point = 32
                         total_bytes = num_points * bytes_per_point
                         data_bytes = recv_exact(conn, total_bytes)
                         if not data_bytes: 
-                            print("   ❌ 未收到完整力控数据")
+                            print("   ❌ Failed to receive complete force control data")
                             break
 
                         # 3. 解析与转换数据
@@ -819,11 +896,11 @@ def main():
                                         'force': float(target_force)  # 加入 force 字段
                                     })
 
-                                    print(f"   [{i}] 位置:{np.round(r_pos, 3)} | 姿态RPY:{np.round(res['robot_rpy'], 1)}° | 目标力:{target_force:.1f}N")
+                                    print(f"   [{i}] Position:{np.round(r_pos, 3)} | Orientation RPY:{np.round(res['robot_rpy'], 1)}° | Target Force:{target_force:.1f}N")
 
                             # 4. 生成带姿态和【力】的平滑路径
                             if len(path_with_force) >= 2:
-                                print(f"\n   [Interpolation] 正在生成力控平滑路径...")
+                                print(f"\n   [Interpolation] Generating Smooth Path with Force...")
                                 
                                 # 注意：你的插值函数需要更新，以支持 force 字段（见下文）
                                 final_smooth_path = pathInterpolation.generate_smooth_path_with_orientation(
@@ -836,7 +913,7 @@ def main():
                                 if robot is None: 
                                     robot = RobotController()
                                 
-                                print(f"   🚀 开始执行力控轨迹，总插值点数: {len(final_smooth_path)}")
+                                print(f"   🚀 Starting Force Control Trajectory, Total Interpolated Points: {len(final_smooth_path)}")
                                 # 统一使用 execute_path，不再需要传 mode 参数
                                 robot.execute_path(final_smooth_path, speed=0.02)
 
@@ -844,7 +921,7 @@ def main():
                                 # 假设目标点是路径的最后一个点
                                 target_pos = final_smooth_path[-1]['pos'] 
 
-                                print(" ⏳ 等待机械臂到达目标位置...")
+                                print(" ⏳ Waiting for robot to reach target position...")
                                 while True:
                                     # 获取机械臂当前的实时位置 (你可以从你的 robot_listener 获取)
                                     current_pos = robot_listener.get_position() 
@@ -861,11 +938,11 @@ def main():
 
                                 try:
                                     conn.sendall(b'm')
-                                    print("   ✅ [TCP] 机械臂力控运动完毕，已向 HoloLens 发送 'm' 解锁信号")
+                                    print("   ✅ [TCP] Robot force control motion completed, 'm' unlock signal sent to HoloLens")
                                 except Exception as e:
-                                    print(f"   ❌ 发送完成信号失败: {e}")
+                                    print(f"   ❌ Failed to send completion signal: {e}")
                         else:
-                            print("   ⚠️ T_M 矩阵为空，请先进行校准发送 'c'！")
+                            print("   ⚠️ T_M matrix is empty, please calibrate first by sending 'c'!")
                         print("="*50 + "\n")
 
                     # ===============================================
@@ -915,7 +992,7 @@ def main():
                             cv2.imshow(f"HoloLens Stream ({sensor_type})", frame)
                             cv2.waitKey(1) # 必须有这一句，OpenCV 才能刷新窗口
                         else:
-                            print(f"   ⚠️ 图像解码失败，接收长度: {img_len}")
+                            print(f" ⚠️ Image decoding failed, received length: {img_len}")
 
                     # ===============================================
                     # CASE 'e': 接收眼动追踪坐标 (Eye Tracking)
@@ -952,7 +1029,7 @@ def main():
                                 
                             #print(f"👁️ [TCP] 眼动坐标已更新...")
                         else:
-                            print("   ⚠️ T_M 矩阵为空，无法转换眼动坐标！")
+                            print("   ⚠️ T_M is None. Cannot transform gaze coordinates. Please calibrate first.")
 
                     # ===============================================
                     # 🌟 CASE 'h': 接收原生手掌跟踪坐标 (Header 'h')
@@ -967,34 +1044,34 @@ def main():
                                 # 转换为机器人坐标并存入全局变量
                                 global_holo_hand_pos = rut.unity2robot_transform(u_hand_pos, T_M)
                             else:
-                                print("  ⚠️ T_M 矩阵为空，无法转换手掌坐标！")
+                                print("  ⚠️ T_M is None. Cannot transform hand coordinates. Please calibrate first.")
 
                     elif header == 'O': 
                         is_HRI_Demo = True
-                        print("Demo模式已开")
+                        print("Demo Mode Activated")
                     elif header == 'P': 
                         is_HRI_Demo = False
-                        print("Demo模式已关")
+                        print("Demo Mode Deactivated")
                 elif header == 'S': 
                     sender.is_streaming = True
-                    print("▶️ 开始传输")
+                    print("▶️ Video Streaming Started")
                 elif header == 'E': 
                     sender.is_streaming = False
-                    print("⏹️ 停止传输")
+                    print("⏹️ Video Streaming Stopped")
 
                 elif header == 'K': 
                     is_skeleton_streaming = True
-                    print("▶️ 开始传输【骨架数据】")
+                    print("▶️ Skeleton Streaming Started")
                 elif header == 'L': 
                     is_skeleton_streaming = False
-                    print("⏹️ 停止传输【骨架数据】")
+                    print("⏹️ Skeleton Streaming Stopped")
                 
                 elif header == 'J': 
                     is_robot_state_streaming = True
-                    print("▶️ 开始以 30Hz 传输【全关节实时位姿】(Python端已转换)")
+                    print("▶️ Started streaming 【Full Joint Real-time Poses】(Converted on Python side)")
                 elif header == 'H': 
                     is_robot_state_streaming = False
-                    print("⏹️ 停止传输【全关节实时位姿】")
+                    print("⏹️ Stopped streaming 【Full Joint Real-time Poses】")
 
                 # ===============   ================================
                 # CASE 'x': 退出 (Exit)
@@ -1125,7 +1202,7 @@ def main():
                     if robot is None:
                         robot = RobotController()
                     print("\n" + "="*50)
-                    print("🤖 [HRI] 收到指令，启动人机交互流程！")
+                    print("🤖 [HRI] Command received, starting HRI workflow!")
                     current_hri_state = STATE_INIT # 切入状态 0
                     print("="*50 + "\n")
 
@@ -1141,7 +1218,7 @@ def main():
                 elif current_hri_state == STATE_INIT:
                     # 刚进入 STATE_INIT 时，触发一次运动并记录时间
                     if hri_start_time == 0.0:
-                        print("🔄 [HRI] 状态 0: 机械臂前往初始观测位姿...")
+                        print("🔄 [HRI] State 0 (Initial Pose): Moving robot to initial observation pose...")
                         if robot is not None:
                             robot.move_to(INIT_POSE, speed=0.05)
                         hri_start_time = time.time() # 🌟 开始计时！
@@ -1149,7 +1226,7 @@ def main():
                     # 每次循环检查时间是否够了，如果没够就直接跳过，继续发视频
                     else:
                         if time.time() - hri_start_time > 20.0:
-                            print(" ✅ [HRI] 5秒已过，假设已到达初始位置，切入人体跟踪状态！")
+                            print(" ✅ [HRI] State 0 (Initial Pose): 20 seconds passed. Starting visual servoing to track the user...")
                             if robot is not None:
                                 robot.start_tracking()
                             current_hri_state = STATE_TRACKING
@@ -1163,7 +1240,7 @@ def main():
                     # YOLO 至少需要 11 个点才能拿到左右手腕 (Index 9, 10)
                     if skeleton_coord_camera is not None and len(skeleton_coord_camera) > 10:
                         
-            # 🌟【全新防抖逻辑】：不再一帧定生死，而是塞入时间窗口
+                        # 🌟【全新防抖逻辑】：不再一帧定生死，而是塞入时间窗口
                         current_intent = check_reach_intent(skeleton_coord_camera)
                         intent_history.append(current_intent)
                         
@@ -1175,7 +1252,7 @@ def main():
                             
                             # 如果超过 80% 的帧都判定为伸手
                             if true_ratio >= 0.8:
-                                print(f" 🎯 [HRI] 连续确认伸手意图 (置信度: {true_ratio*100:.1f}%)！停止跟踪，准备看向桌面...")
+                                print(f" 🎯 [HRI] State 1 (Tracking): Continuous confirmation of reaching intent (Confidence: {true_ratio*100:.1f}%)! Stopping tracking, preparing to look at the table...")
                                 
                                 if robot is not None:
                                     robot.stop_tracking() 
@@ -1202,7 +1279,7 @@ def main():
                             cam_y = chest_3d[1] # 单位：米
 
                             # 🐞 【核心 DEBUG 1】：看看相机到底输出了什么级别的坐标
-                            print(f"👀 [视觉测距] 胸口物理坐标: X={cam_x:.4f}m, Y={cam_y:.4f}m, 深度Z={chest_3d[2]:.4f}m")
+                            print(f"👀 [HRI] State 1 (Tracking) Chest Center: X={cam_x:.4f}m, Y={cam_y:.4f}m, DepthZ={chest_3d[2]:.4f}m")
                             
                             # 轴向映射
                             base_err_x = 0.0       
@@ -1229,7 +1306,7 @@ def main():
                 elif current_hri_state == STATE_CHECK_INTENT:
                     
                     if hri_start_time == 0.0:
-                        print("👀 [HRI] 状态 2: 机械臂低头，看向桌面目标区域...")
+                        print("👀 [HRI] State 2 (Checking Intent): Moving robot to look at the table...")
                         if robot is not None:
                             # 前往我们预设好的桌面观测点
                             # 请确保在 main() 开头定义了 LOOK_AT_TABLE_POSE = [x, y, z, qx, qy, qz, qw]
@@ -1241,7 +1318,7 @@ def main():
                     else:
                         # 非阻塞等待机械臂走到位 (这里给 4 秒时间，可根据实际距离调整)
                         if time.time() - hri_start_time > 10.0:
-                            print(" ✅ [HRI] 视线已锁定桌面！准备进入物品识别 (State 3)...")
+                            print(" ✅ [HRI] State 2 (Checking Intent): Line of sight locked on the table! Preparing to enter object recognition (State 3)...")
                             current_hri_state = STATE_SCAN_OBJECTS
                             hri_start_time = 0.0
 
@@ -1252,13 +1329,12 @@ def main():
                     
                     if hri_start_time == 0.0:
                         if not has_completed_initial_scan:
-                            print(f"\n🚀 [HRI] 状态 3: 启动首次全自动物理扫描。计划点数: {SCAN_STEPS}")
+                            print(f"\n🚀 [HRI] State 3 (Scanning Objects): Starting first automatic physical scan. Planned points: {SCAN_STEPS}")
                             scan_current_step = 0 
                             if robot is not None:
                                 robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
                         else:
-                            print(f"\n🚀 [HRI] 状态 3: 跳过物理扫描，直接复用并刷新已有环境记忆...")
-                            # 🌟 核心魔法：直接设为满值，跳过底下的所有拍照和移动！
+                            print(f"\n🚀 [HRI] State 3 (Scanning Objects): Skipping physical scan, directly reusing and refreshing existing environment memory...")
                             scan_current_step = SCAN_STEPS 
                             
                         hri_start_time = time.time()
@@ -1277,13 +1353,35 @@ def main():
                                 target_pos = scan_waypoints[scan_current_step][0:3]
                                 dist = np.linalg.norm(np.array(ee_pos) - np.array(target_pos))
                                 
-                                if last_capture_time == 0.0:
-                                    if dist < 0.02 and is_robot_idle: 
-                                        print(f"📍 已到达节点 {scan_current_step + 1}！停顿 0.8 秒防抖...")
-                                        last_capture_time = time.time()
+                                # 🌟【核心魔改】基于当前步数，动态配置就位规则与消震时间
+                                if scan_current_step == 0:
+                                    # 🚨 仅针对起点：引入手腕旋转判定 + 0.8秒强力消震
+                                    target_quat = scan_waypoints[scan_current_step][3:7]
+                                    is_rotation_ok = robot.is_rotation_reached(target_quat, tolerance_deg=1.5) if robot is not None else True
+                                    
+                                    is_ready_to_stop = (dist < 0.02) and is_rotation_ok and is_robot_idle
+                                    delay_threshold = 0.8
+                                    arrival_log = "📍 [State 3 (Scanning Objects)] Position and wrist angle aligned 100%! Starting 0.8s anti-shake..."
                                 else:
-                                    if time.time() - last_capture_time > 0.5: 
-                                        print(f"📸 正在获取第 {scan_current_step + 1}/{SCAN_STEPS} 个视角的点云...")
+                                    # 🟢 针对中间点：放开限制，不检查旋转，恢复你原本的 0.5 秒轻度停顿
+                                    is_ready_to_stop = (dist < 0.02) and is_robot_idle
+                                    delay_threshold = 0.5
+                                    arrival_log = f"📍 [State 3 (Scanning Objects)] Arrived at node {scan_current_step + 1}! Pausing 0.5s for anti-shake..."
+
+                                # -----------------------------------------------------
+                                # 第一阶段：就位拦截（起点用严格规则，中间点用宽松规则）
+                                # -----------------------------------------------------
+                                if last_capture_time == 0.0:
+                                    if is_ready_to_stop: 
+                                        print(arrival_log)
+                                        last_capture_time = time.time()
+                                        
+                                # -----------------------------------------------------
+                                # 第二阶段：满足各自的倒计时后，统一执行点云获取
+                                # -----------------------------------------------------
+                                else:
+                                    if time.time() - last_capture_time > delay_threshold: 
+                                        print(f"📸 [State 3 (Scanning Objects)] Acquiring point cloud from view {scan_current_step + 1}/{SCAN_STEPS}...")
                                         
                                         current_point_cloud = BodyPointCloud_dual.global_latest_verts
                                         current_colors = BodyPointCloud_dual.global_latest_colors 
@@ -1300,39 +1398,41 @@ def main():
                                                 p_crop, ee_pos, ee_quat, EE_T_C
                                             )
                                             scene_mapper.add_point_cloud(verts_robot_base, c_crop)
-                                            print(f"   ✅ 节点 {scan_current_step + 1} 拼合成功。")
+                                            print(f"   ✅ [State 3 (Scanning Objects)] Node {scan_current_step + 1}拼合成功。")
                                         else:
-                                            print(f"   ⚠️ 节点 {scan_current_step + 1} 数据获取失败，跳过。")
+                                            print(f"   ⚠️ [State 3 (Scanning Objects)] Node {scan_current_step + 1} 数据流丢帧，跳过该帧。")
                                             
+                                        # 迈向下一步
                                         scan_current_step += 1
                                         if scan_current_step < SCAN_STEPS:
                                             if robot is not None:
                                                 robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
-                                            last_capture_time = 0.0 
-                            
+                                        last_capture_time = 0.0
+
+                                        
                             # =========================================================
                             # 【已走完或直接跳过时】：进入安全后处理与退回阶段
                             # =========================================================
                             else:
                                 if getattr(scene_mapper, 'scan_post_process', 0) == 0:
-                                    print("\n🎉 [HRI] 开始处理/刷新点云地图数据...")
+                                    print("\n🎉 State 3 (Scanning Objects): Starting processing/refreshing point cloud map data...")
                                     
                                     final_pcd = scene_mapper.global_pcd
                                     
                                     # 防崩保护：如果桌上的东西全抓完了，点云没了，直接跳回待机
                                     if final_pcd is None or len(final_pcd.points) < 50:
-                                        print("⚠️ 桌面已空，没有足够的点云数据！自动切回待机状态...")
+                                        print("⚠️ State 3 (Scanning Objects): Table is empty, not enough point cloud data! Automatically switching back to idle state...")
                                         current_hri_state = STATE_IDLE
                                         hri_start_time = 0.0
                                         scene_mapper.scan_post_process = 0
                                         continue
 
-                                    print("   ✂️ 0. 正在进行 Z 轴高度直通滤波...")
+                                    print("   ✂️ State 3 (Scanning Objects): 0. Performing Z axis cropping to remove floor and ceiling points...")
                                     points = np.asarray(final_pcd.points)
                                     valid_z_indices = np.where(points[:, 2] >= -0.25)[0] 
                                     final_pcd = final_pcd.select_by_index(valid_z_indices)
 
-                                    print("   🧹 1. 正在执行统计学滤波降噪...")
+                                    print("   🧹 State 3 (Scanning Objects): 1. Performing statistical filtering for noise reduction...")
                                     cleaned_pcd, _ = final_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
                                     
                                     scene_mapper.global_pcd = cleaned_pcd
@@ -1343,12 +1443,15 @@ def main():
                                     try:
                                         # 保存为 .pcd 格式 (你可以换成 .ply 格式)
                                         o3d.io.write_point_cloud("scanned_scene.pcd", cleaned_pcd)
-                                        print("   💾 [系统] 已将当前桌面点云成功保存为 scanned_scene.pcd")
+                                        print("   💾 [State 3 (Scanning Objects)] Current desktop point cloud successfully saved as scanned_scene.pcd")
+
+                                        if T_M is not None:
+                                            send_point_cloud_to_hololens(conn, cleaned_pcd, T_M)
                                     except Exception as e:
-                                        print(f"   ❌ [系统] 保存点云失败: {e}")
-                                    
+                                        print(f"   ❌ [State 3 (Scanning Objects)] Failed to save point cloud: {e}")
+
                                     if request_grasps_from_graspnet is not None and not has_completed_initial_scan:
-                                        print("\n   📦 准备打包真实点云与相机内参 K_1...")
+                                        print("\n   📦 [State 3 (Scanning Objects)] Preparing to package real point cloud and camera intrinsic parameters K_1...")
                                         
                                         # 1. 获取当前拍照位置的相机到机器人基座的变换矩阵
                                         ee_pos, ee_quat = robot_listener.get_current_pose()
@@ -1379,15 +1482,15 @@ def main():
                                     # 🌟 标记：第一次完整的物理扫描已经完成了！以后都不用再扫了
                                     has_completed_initial_scan = True 
 
-                                    print("   🪚 2. 正在识别桌面 (RANSAC)...")
+                                    print("   🪚 State 3 (Scanning Objects): 2. Identifying table (RANSAC)...")
                                     plane_model, inliers = cleaned_pcd.segment_plane(distance_threshold=0.01, ransac_n=3, num_iterations=1000)
                                     objects_pcd = cleaned_pcd.select_by_index(inliers, invert=True)
 
                                     table_points = np.asarray(cleaned_pcd.select_by_index(inliers).points)
                                     scene_mapper.table_z = np.mean(table_points[:, 2]) 
-                                    print(f"   📏 测得桌面绝对物理高度: Z = {scene_mapper.table_z:.4f} 米")
+                                    print(f"   📏 State 3 (Scanning Objects): Measured absolute table height: Z = {scene_mapper.table_z:.4f} meters")
                                     
-                                    print("   📦 3. 正在聚类剩余物体...")
+                                    print("   📦 State 3 (Scanning Objects): 3. Clustering remaining objects...")
                                     labels = np.array(objects_pcd.cluster_dbscan(eps=0.03, min_points=30))
                                     
                                     valid_mask = labels >= 0  
@@ -1407,9 +1510,9 @@ def main():
 
                                     scene_mapper.objects_pcd = clean_objects_pcd
                                     scene_mapper.object_labels = clean_labels
-                                    print(f"   ✅ 环境刷新完毕！桌面剩余 {clean_labels.max() + 1 if len(clean_labels)>0 else 0} 个目标。")
+                                    print(f"   ✅ State 3 (Scanning Objects): Environment refreshed! {clean_labels.max() + 1 if len(clean_labels)>0 else 0} objects remaining on the table.")
                                     
-                                    print(f"   🤖 正在前往安全观测/递送准备位...")
+                                    print(f"   🤖 State 3 (Scanning Objects): Moving to safe observation/delivery position...")
                                     if robot is not None:
                                         robot.move_to(READY_FOR_PASSING_POSE, speed=0.05)
                                         
@@ -1425,7 +1528,7 @@ def main():
                                         ai_grasps_camera = scene_mapper.ai_future.result() 
                                         
                                         if ai_grasps_camera is not None:
-                                            print(f"🧠 AI 在相机系下预测了 {ai_grasps_camera.shape[0]} 个姿态，正在正变换至机器人基座...")
+                                            print(f"🧠 State 3 (Scanning Objects): AI in camera frame predicted {ai_grasps_camera.shape[0]} poses, transforming to robot base frame...")
                                             
                                             # 拿出刚才状态 3 存下来的那一瞬间的 ROBOT_T_C
                                             ROBOT_T_C = scene_mapper.current_robot_t_c
@@ -1439,24 +1542,25 @@ def main():
                                             
                                             # 自动保存到本地文件
                                             np.save("test_output_grasps.npy", ai_grasps_base)
-                                            print("🎉 [AI] 异步推理并坐标对齐成功完成！文件已保存。")
+                                            print("🎉 [State 3 (Scanning Objects)] Asynchronous inference and coordinate alignment completed successfully! File saved.")
                                             
                                         scene_mapper.scan_post_process = 1
                                         
                                 elif getattr(scene_mapper, 'scan_post_process', 0) == 1:
                                     if is_robot_idle and (time.time() - hri_start_time > 1.0):
-                                        print("\n👀 切换至状态 4: 请通过眼动凝视选择目标物体...")
+                                        print("\n👀 [State 3 (Scanning Objects)] Switching to state 4: Please use gaze to select the target object...")
                                         current_hri_state = STATE_GAZE_INTERSECTION
                                         hri_start_time = 0.0
                                         scene_mapper.scan_post_process = 0 # 重置标记
+
 
                 # -----------------------------------
                 # 状态 4：全景眼动求交 + 纯净物品吸附
                 # -----------------------------------
                 elif current_hri_state == STATE_GAZE_INTERSECTION:
-                    
+                                        
                     if hri_start_time == 0.0:
-                        print("👀 [HRI] 状态 4: 请凝视你要抓取的物体 (持续 2 秒)...")
+                        print("👀 [State 4 (Gaze Intersection)]: Please gaze at the object you want to grasp (hold for 2 seconds)...")
                         hri_start_time = time.time()
                         debug_print_time = time.time() 
                         
@@ -1493,12 +1597,12 @@ def main():
                                 conn.sendall(packet_p)
                                 conn.setblocking(False)
                             except Exception as e:
-                                print(f"⚠️ [TCP] 发送实时光标失败: {e}")
+                                print(f"⚠️ [TCP] State 4 (Gaze Intersection)]: Failed to send cursor position: {e}")
                         # ==========================================
 
                         if time.time() - debug_print_time > 0.5:
                             if current_pt is not None:
-                                print(f"🎯 [Debug] 视线落点 : {np.round(current_pt, 3)}")
+                                print(f"🎯 [Debug] State 4 (Gaze Intersection): Gaze point : {np.round(current_pt, 3)}")
                             debug_print_time = time.time()
 
                         # 🎯 2. 凝视确认与“智能吸附”
@@ -1523,7 +1627,7 @@ def main():
                                             
                                             # 如果你看的地方方圆 20 厘米内根本没有盒子，说明你在看空桌子，放弃抓取
                                             if distance_to_box > 0.3:
-                                                print(f"\n ⚠️ 视线落点周围没有盒子，请看向盒子！ distance to box : {np.round(distance_to_box, 3)}")
+                                                print(f"\n ⚠️ [State 4 (Gaze Intersection)]: No boxes found around gaze point, please look at a box! distance to box : {np.round(distance_to_box, 3)}")
                                                 fixation_point = None
                                                 fixation_start_time = time.time()
                                                 continue
@@ -1535,12 +1639,12 @@ def main():
                                             # 🔍【全面诊断补丁】打印所有盒子中心、视线落点及吸附过程
                                             # =======================================================
                                             print("\n" + "🔍" * 20)
-                                            print(f"🎯 [Gaze Debug] 视线在世界系(机器人基座)下的实时落点: {np.round(fixation_point, 3)}")
-                                            print(f"🧲 [Gaze Debug] KDTree 离你眼睛最近的点距离是: {np.round(distance_to_box * 100, 1)} cm")
+                                            print(f"🎯 [State 4 (Gaze Intersection)]: Gaze point in world frame (robot base): {np.round(fixation_point, 3)}")
+                                            print(f"🧲 [State 4 (Gaze Intersection)]: Distance to nearest point from KDTree: {np.round(distance_to_box * 100, 1)} cm")
                                             
                                             # 遍历当前场景里所有被分割出来的不同盒子，算出它们各自的中心点
                                             unique_labels = np.unique(scene_mapper.object_labels)
-                                            print(f"📦 [Gaze Debug] 当前大记忆地图中一共检测到 {len(unique_labels)} 个物体:")
+                                            print(f"📦 [State 4 (Gaze Intersection)]: Currently detected {len(unique_labels)} objects in the memory map:")
                                             
                                             for label in unique_labels:
                                                 # 提取这个标签对应的所有点
@@ -1554,7 +1658,7 @@ def main():
                                                 dist_from_gaze = np.linalg.norm(fixation_point - lbl_center)
                                                 
                                                 # 如果这个标签刚好是被吸附的标签，加个醒目的五星标记
-                                                flag = "⭐ [已锁定录用]" if label == box_id else "  "
+                                                flag = "⭐ [State 4 (Gaze Intersection)]: Target Object" if label == box_id else "  "
                                                 print(f"   {flag} 物体ID {label} -> 几何中心: {np.round(lbl_center, 3)} | 离你视线落点距离: {np.round(dist_from_gaze * 100, 1)} cm")
                                             print("🔍" * 20 + "\n")
                                             # =======================================================
@@ -1587,7 +1691,7 @@ def main():
                                             ghost_indices_obj = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.objects_pcd.points)
                                             scene_mapper.objects_pcd = scene_mapper.objects_pcd.select_by_index(ghost_indices_obj, invert=True)
                                             
-                                            print(f"🧹 已将 [盒子 {box_id}] 的残影从全局点云地图中永久擦除！")
+                                            print(f"🧹 [State 4 (Gaze Intersection)]: Successfully removed ghost points of box {box_id} from the global point cloud map!")
                                             # =======================================================
 
                                             # 3. 获取真正的几何中心 (这比 np.mean 准得多！)
@@ -1595,123 +1699,58 @@ def main():
 
                                             # 4. 获取盒子的长宽高尺寸 (用于决定夹爪张开多大)
                                             box_size = obb.extent 
-                                            print(f"📦 盒子尺寸: 长宽高 {np.round(box_size, 3)} 米")
+                                            print(f"📦 [State 4 (Gaze Intersection)]: Box dimensions: {np.round(box_size, 3)} meters")
 
                                             # 5. 获取盒子的旋转矩阵 (用于对齐夹爪姿态！)
                                             box_rotation = obb.R
                                             
-                                            print(f"\n 🎉 成功吸附！目标锁定为 [盒子 {box_id}]")
-                                            print(f" 🎯 盒子几何中心坐标: {np.round(box_center, 3)}")
+                                            print(f"\n 🎉 [State 4 (Gaze Intersection)]: Target Box {box_id}")
+                                            print(f" 🎯 Box Geometry Center: {np.round(box_center, 3)}")
                                             
-                                            # # =======================================================
-                                            # # 智能匹配：在 AI 预测的多个抓取位姿中，选出一个距离盒子中心最近的唯一最优姿态！
-                                            # # =======================================================
-                                            # if hasattr(scene_mapper, 'ai_grasps') and scene_mapper.ai_grasps is not None and len(scene_mapper.ai_grasps) > 0:
-                                            #     min_grasp_dist = float('inf')
-                                            #     closest_grasp = None
-                                            #     closest_idx = -1
-                                                
-                                            #     # 遍历 4060 传回来并转好基座系的所有 4x4 抓取矩阵
-                                            #     for idx_g, grasp_matrix in enumerate(scene_mapper.ai_grasps):
-                                            #         # 提取矩阵中前 3 行第 4 列的 [X, Y, Z] 空间平移坐标
-                                            #         grasp_xyz = grasp_matrix[:3, 3]
-                                                    
-                                            #         # 计算该抓取点到当前凝聚盒子中心的欧氏距离
-                                            #         dist = np.linalg.norm(grasp_xyz - box_center)
-                                                    
-                                            #         if dist < min_grasp_dist:
-                                            #             min_grasp_dist = dist
-                                            #             closest_grasp = grasp_matrix
-                                            #             closest_idx = idx_g
-                                                
-                                            #     # 🌟 在这里！锁定唯一解后，立刻进行工具层面的“局部微调”
-                                            #     if closest_grasp is not None:
-                                            #         # 1. 绕局部 Z 轴自转 90 度
-                                            #         Rz_90 = np.array([
-                                            #             [ 0.0, -1.0,  0.0,  0.0],
-                                            #             [ 1.0,  0.0,  0.0,  0.0],
-                                            #             [ 0.0,  0.0,  1.0,  0.0],
-                                            #             [ 0.0,  0.0,  0.0,  1.0]
-                                            #         ])
-                                            #         tuned_grasp = closest_grasp @ Rz_90
-                                                    
-                                            #         # 2. 如果需要，还可以顺便把深度下探也叠加上去（选填）
-                                            #         # local_advance = np.eye(4)
-                                            #         # local_advance[2, 3] = 0.018 # 向前推进 1.8 厘米
-                                            #         # tuned_grasp = tuned_grasp @ local_advance
-                                                    
-                                            #         # 最终成型，挂载到 selected_grasp 上
-                                            #         scene_mapper.selected_grasp = tuned_grasp
-                                                    
-                                            #     else:
-                                            #         scene_mapper.selected_grasp = None
-                                            #     # 将筛选出的唯一最优姿态保存至 scene_mapper 供下一步使用
 
-                                            #     print(f"🎯 [智能匹配] 成功锁定最佳抓取位姿！")
-                                            #     print(f"   👉 抓取索引: {closest_idx} / {len(scene_mapper.ai_grasps)}")
-                                            #     print(f"   👉 距离物品中心: {np.round(min_grasp_dist, 3)} 米")
+                                        #    
+                                        # =======================================================
+                                        # 🪐【重构筛选】多目标优选 —— 提取前3名顺位黄金抓取姿态
+                                        # =======================================================
+                                        if hasattr(scene_mapper, 'ai_grasps') and scene_mapper.ai_grasps is not None and len(scene_mapper.ai_grasps) > 0:
+                                            CANDIDATE_POOL_LIMIT = 40 
+                                            candidates_scored = [] # 新增：用于存放所有合法姿态的临时列表
+                                            
+                                            # 1. 第一轮过滤与双标大评分
+                                            for idx_g, grasp_matrix in enumerate(scene_mapper.ai_grasps[:CANDIDATE_POOL_LIMIT]):
+                                                grasp_xyz = grasp_matrix[:3, 3]
+                                                approach_vector = grasp_matrix[:3, 2] 
                                                 
-                                            # else:
-                                            #     print("⚠️ [警告] 内存中未检测到 AI 的抓取姿态列表 (scene_mapper.ai_grasps 为空)！")
-                                            #     scene_mapper.selected_grasp = None
-                                            # # ==============================
+                                                # A. 计算探针距离
+                                                PROJECTION_DEPTH = 0.15 
+                                                projected_xyz = grasp_xyz + PROJECTION_DEPTH * approach_vector
+                                                dist_to_center = np.linalg.norm(projected_xyz - box_center)
+                                                if dist_to_center > 0.15: continue
+                                                    
+                                                # B. 计算倾斜垂直度
+                                                downward_vector = np.array([0.0, 0.0, -1.0])
+                                                tilt_alignment = np.dot(approach_vector, downward_vector)
+                                                tilt_alignment = np.clip(tilt_alignment, -1.0, 1.0)
+                                                if tilt_alignment < 0.64: continue
+                                                    
+                                                # C. 综合评分并塞入池中
+                                                distance_score = 1.0 - (dist_to_center / 0.15)
+                                                combined_score = 0.6 * distance_score + 0.4 * tilt_alignment
+                                                
+                                                candidates_scored.append((combined_score, grasp_matrix, dist_to_center, tilt_alignment, idx_g))
 
-                                            # =======================================================
-                                            # 🪐【重构核心】探针投影 + 垂直度评分 + 45°校准 + 4cm深插 + 180°抄近道
-                                            # =======================================================
-                                            if hasattr(scene_mapper, 'ai_grasps') and scene_mapper.ai_grasps is not None and len(scene_mapper.ai_grasps) > 0:
+                                            # 2. 第二轮：按照得分从高到低强行排序，并斩取前 3 名
+                                            candidates_scored.sort(key=lambda x: x[0], reverse=True)
+                                            top_3_candidates = candidates_scored[:3]
+                                            
+                                            if len(top_3_candidates) > 0:
+                                                scene_mapper.tuned_grasps_pool = [] # 🌟 新增：存放微调后的前3顺位矩阵池
                                                 
-                                                CANDIDATE_POOL_LIMIT = 40 
-                                                selected_grasp = None
-                                                selected_idx = -1
+                                                print(f"\n🎯 [多目标筛选] 针对当前目标成功锁定 {len(top_3_candidates)} 个顺位备份姿态:")
                                                 
-                                                # 🌟 核心参数设置
-                                                PROJECTION_DEPTH = 0.15      # 你的 15cm 探针投影深度
-                                                BEST_COMBINED_SCORE = -1.0   # 综合评分，越高越好
-                                                
-                                                # 3. 遍历高分精英池
-                                                for idx_g, grasp_matrix in enumerate(scene_mapper.ai_grasps[:CANDIDATE_POOL_LIMIT]):
-                                                    grasp_xyz = grasp_matrix[:3, 3]
-                                                    approach_vector = grasp_matrix[:3, 2] # 提取夹爪局部 +Z 轴
-                                                    
-                                                    # A. 🚀 计算【你的探针距离分数】
-                                                    projected_xyz = grasp_xyz + PROJECTION_DEPTH * approach_vector
-                                                    dist_to_center = np.linalg.norm(projected_xyz - box_center)
-                                                    
-                                                    # 如果探针射得太偏（比如偏离中心 15 厘米以上），直接一票否决
-                                                    if dist_to_center > 0.15:
-                                                        continue
-                                                        
-                                                    # B. 📐 计算【倾斜度/垂直度分数】
-                                                    # 机器人基座坐标系下，绝对垂直朝下的标准矢量是 [0, 0, -1]
-                                                    # 通过点积计算夹爪 Z 轴与绝对向下的贴合度。数值越接近 1.0，说明越笔直朝下！
-                                                    downward_vector = np.array([0.0, 0.0, -1.0])
-                                                    tilt_alignment = np.dot(approach_vector, downward_vector)
-                                                    
-                                                    # 确保 tilt_alignment 在 [-1, 1] 之间（防止浮点数溢出）
-                                                    tilt_alignment = np.clip(tilt_alignment, -1.0, 1.0)
-                                                    
-                                                    # 物理意义：如果夹爪倾斜度太夸张（比如和垂直方向夹角大于 50 度，即对齐度小于 0.64），直接淘汰
-                                                    if tilt_alignment < 0.64:
-                                                        continue
-                                                        
-                                                    # C. 🏆 综合双标大评分（多目标优化）
-                                                    # 距离项：1.0 - (dist / 0.15)，距离越近越趋近于 1.0
-                                                    # 垂直项：tilt_alignment，越垂直越趋近于 1.0
-                                                    # 权重分配：0.4 给距离，0.6 给垂直度（你可以根据实际效果微调权重）
-                                                    distance_score = 1.0 - (dist_to_center / 0.15)
-                                                    combined_score = 0.6 * distance_score + 0.4 * tilt_alignment
-                                                    
-                                                    # 寻找全场最符合人类审美（又准又直）的最高分天选姿态
-                                                    if combined_score > BEST_COMBINED_SCORE:
-                                                        BEST_COMBINED_SCORE = combined_score
-                                                        selected_grasp = grasp_matrix
-                                                        selected_idx = idx_g
-                                                        saved_dist = dist_to_center
-                                                        saved_tilt = tilt_alignment
-                                                
-                                                if selected_grasp is not None:
-                                                    # 4. 注入 45 度自转矩阵（对准物理夹爪）
+                                                # 3. 统一对前3名进行局部微调运算
+                                                for rank, (score, selected_grasp, saved_dist, saved_tilt, selected_idx) in enumerate(top_3_candidates):
+                                                    # 注入 45 度自转
                                                     Rz_45 = np.array([
                                                         [ 0.7071,  0.7071,  0.0,  0.0],
                                                         [-0.7071,  0.7071,  0.0,  0.0],
@@ -1720,60 +1759,38 @@ def main():
                                                     ])
                                                     tuned_grasp = selected_grasp @ Rz_45
                                                     
-                                                    # 5. 注入 4 厘米硬核深插下探（消灭虚抓）
+                                                    # 注入 7 厘米深插下探
                                                     local_advance = np.eye(4)
                                                     local_advance[2, 3] = 0.070 
                                                     tuned_grasp = tuned_grasp @ local_advance
                                                     
-                                                    # =======================================================
-                                                    # 🌟 夹爪对称性优化 (180° 抄近道算法)
-                                                    # =======================================================
+                                                    # 180° 抄近道对称性优化
                                                     ee_pos_temp, ee_quat_temp = robot_listener.get_current_pose()
                                                     from scipy.spatial.transform import Rotation as Rot
                                                     R_curr = Rot.from_quat(ee_quat_temp).as_matrix()
-                                                    
                                                     R_target1 = tuned_grasp[:3, :3]
-                                                    Rz_180 = np.array([
-                                                        [-1.0,  0.0,  0.0],
-                                                        [ 0.0, -1.0,  0.0],
-                                                        [ 0.0,  0.0,  1.0]
-                                                    ])
+                                                    Rz_180 = np.array([[-1.0,0.0,0.0],[0.0,-1.0,0.0],[0.0,0.0,1.0]])
                                                     R_target2 = R_target1 @ Rz_180
-                                                    
-                                                    trace1 = np.trace(R_curr.T @ R_target1)
-                                                    trace2 = np.trace(R_curr.T @ R_target2)
-                                                    
-                                                    if trace2 > trace1:
-                                                        print("💡 [优化] 触发夹爪对称性：已自动翻转 180°，为您节省大量冗余旋转！")
+                                                    if np.trace(R_curr.T @ R_target2) > np.trace(R_curr.T @ R_target1):
                                                         tuned_grasp[:3, :3] = R_target2
-                                                    # =======================================================
 
-                                                    # 6. 最终安全挂载
-                                                    scene_mapper.selected_grasp = tuned_grasp
+                                                    # 存入顺位池
+                                                    scene_mapper.tuned_grasps_pool.append(tuned_grasp)
                                                     
-                                                    # 算出实际倾斜角度，打印出来看着爽
                                                     tilt_angle_deg = np.degrees(np.arccos(saved_tilt))
-                                                    print(f"🎉 [多目标优选成功] 成功锁定又准又直的黄金抓取姿态！")
-                                                    print(f"   👉 选中的 AI 原始索引: {selected_idx}")
-                                                    print(f"   👉 探针直击偏差: {np.round(saved_dist * 100, 1)} cm")
-                                                    print(f"   👉 夹爪倾斜角度: {np.round(tilt_angle_deg, 1)} ° (0.0°代表完美垂直)")
-                                                    print(f"   👉 综合完美指数: {np.round(BEST_COMBINED_SCORE * 100, 1)} / 100")
-                                                else:
-                                                    print(f"⚠️ [未匹配] 精英池里挑了一圈，所有的姿态不是射偏就是太歪，未录用任何抓取！")
-                                                    scene_mapper.selected_grasp = None
+                                                    print(f"   👉 Rank #{rank+1} (Original Index: {selected_idx}) -> Perfect Score: {score*100:.1f} | Deviation: {saved_dist*100:.1f}cm | Tilt Angle: {tilt_angle_deg:.1f}°")
+                                                
+                                                # 4. 初始化默认策略：直接挂载顺位第1（索引0）的黄金姿态，重置重试计数器
+                                                scene_mapper.selected_grasp = scene_mapper.tuned_grasps_pool[0]
+                                                scene_mapper.grasp_retry_count = 0  # 🌟 新增：重试计数器归零
+                                                
+                                                scene_mapper.target_box_points = box_points
+                                                current_hri_state = STATE_GRAB_OBJECT 
+                                                hri_start_time = 0.0
+                                                
                                             else:
-                                                print("⚠️ [警告] 内存中未检测到 AI 抓取列表！")
+                                                print(f"⚠️ [Not Matched] No valid grasp candidates found for the selected box {box_id}. Please try again.")
                                                 scene_mapper.selected_grasp = None
-                                            # =======================================================
-
-                                            scene_mapper.target_box_points = box_points
-                                            current_hri_state = STATE_GRAB_OBJECT 
-                                            hri_start_time = 0.0
-                                            
-                                        else:
-                                            print("⚠️ 场景中没有找到任何盒子！")
-                                            fixation_point = None
-                                            fixation_start_time = time.time()
                                 else:
                                     fixation_point = current_pt
                                     fixation_start_time = time.time()
@@ -1781,114 +1798,14 @@ def main():
                             fixation_point = None
                             fixation_start_time = 0.0
 
-                # # -----------------------------------
-                # # 状态 5：高精度纯几何抓取 (Kinematic Grasp)
-                # # -----------------------------------
-                # elif current_hri_state == STATE_GRAB_OBJECT:
-                    
-                #     if hri_start_time == 0.0:
-                #         print("\n" + "="*50)
-                #         print("🦾 [HRI] 状态 5: 开始执行纯视觉几何抓取...")
-                        
-                #         # 1. 获取目标盒子点云，计算 OBB 包围盒
-                #         box_pcd = o3d.geometry.PointCloud()
-                #         box_pcd.points = o3d.utility.Vector3dVector(scene_mapper.target_box_points)
-                #         obb = box_pcd.get_oriented_bounding_box()
-                        
-                #         # 2. 🌟 降维打击计算坐标：X/Y 相信 OBB，Z 相信桌面！
-                #         center_x, center_y, _ = obb.center
-                        
-                #         # 盒子的最高点 Z (结合桌面高度，算出真实的物理最高点)
-                #         box_top_z = np.max(scene_mapper.target_box_points[:, 2])
-                #         box_actual_height = box_top_z - getattr(scene_mapper, 'table_z', 0.0)
-                        
-                #         # 设定抓取点 (比如从盒子最高点往下探 2 厘米)
-                #         GRASP_DEPTH = -0.02
-                #         target_z = box_top_z - GRASP_DEPTH
-                        
-                #         print(f"   📦 目标中心: X={center_x:.3f}, Y={center_y:.3f}")
-                #         print(f"   📏 目标高度: {box_actual_height*100:.1f} cm (抓取深度 Z={target_z:.3f})")
-                        
-                #         # 3. 定义夹爪朝下的固定四元数 (请替换为你实际夹爪垂直朝下的位姿！)
-                #         GRASP_ROT = [-0.92, 0.38, -0.01, -0.00] 
-                        
-                #         # 4. 生成三段式关键点，并安全地挂载到 scene_mapper 上！
-                #         scene_mapper.hover_pose = [center_x, center_y, target_z + 0.15] + GRASP_ROT # 悬停点
-                #         scene_mapper.grasp_pose = [center_x, center_y, target_z ] + GRASP_ROT        # 抓取点
-                #         scene_mapper.lift_pose  = [center_x, center_y, target_z + 0.20] + GRASP_ROT # 提拉点
-                        
-                #         # 5. 立刻派发第一阶段：飞往悬停点
-                #         print("   -> 🛫 阶段 1：飞往正上方悬停...")
-                #         if robot is not None:
-                #             robot.move_to(scene_mapper.hover_pose, speed=0.03) 
-                            
-                #         scene_mapper.grasp_step = 1       # 控制抓取阶段的变量
-                #         hri_start_time = time.time()
-                        
-                #     else:
-                #         # 🌟 新增：获取机械臂是否处于空闲状态 (动作是否执行完毕)
-                #         is_robot_idle = robot.path_queue.empty() if robot is not None else True
-
-                #         # -----------------------------------
-                #         # 阶段 2：飞到上方后，张开夹爪，然后缓慢下探
-                #         # -----------------------------------
-                #         # 修改条件：等待至少 1 秒（防止队列还没塞进去就误判）并且 机械臂动作已走完！
-                #         if getattr(scene_mapper, 'grasp_step', 0) == 1 and time.time() - hri_start_time > 1.0 and is_robot_idle:
-                            
-                #             # 🌟 先张开夹爪！
-                #             if robot is not None:
-                #                 robot.open_gripper(width=0.08) # 张开 8 厘米
-                                
-                #             print("   -> 🛬 阶段 2：夹爪已张开，开始直线缓慢下压...")
-                #             if robot is not None:
-                #                 robot.move_to(scene_mapper.grasp_pose, speed=0.02) 
-                                
-                #             scene_mapper.grasp_step = 2
-                #             hri_start_time = time.time()
-                            
-                #         # -----------------------------------
-                #         # 阶段 3：到达底部，闭合夹爪
-                #         # -----------------------------------
-                #         # 修改条件：下探的动作必须完全走完，才允许闭合夹爪！
-                #         elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 1.5 and is_robot_idle:
-                #             print("   -> ✊ 阶段 3：接触目标，正在闭合夹爪...")
-                            
-                #             # 🌟 抓紧盒子！
-                #             if robot is not None:
-                #                 robot.close_gripper(force=15.0, speed=0.05) # 施加 30N 的抓取力
-                            
-                #             scene_mapper.grasp_step = 3
-                #             hri_start_time = time.time()
-                            
-                #         # -----------------------------------
-                #         # 阶段 4：抓稳后，向上提拉
-                #         # -----------------------------------
-                #         # 这个阶段不用等 is_robot_idle，因为夹爪闭合(close_gripper)本身有 sleep(1.5) 阻塞，
-                #         # 当代码走到这里时，夹爪肯定已经闭合完毕了。
-                #         elif getattr(scene_mapper, 'grasp_step', 0) == 3 and time.time() - hri_start_time > 0.5: 
-                #             print("   -> 🚀 阶段 4：提拉物品...")
-                #             if robot is not None:
-                #                 robot.move_to(scene_mapper.lift_pose, speed=0.05) # 提拉稍微快一点点
-                                
-                #             scene_mapper.grasp_step = 4
-                #             hri_start_time = time.time()
-                            
-                #         # -----------------------------------
-                #         # 任务完成，重置状态
-                #         # -----------------------------------
-                #         elif getattr(scene_mapper, 'grasp_step', 0) == 4 and time.time() - hri_start_time > 1.0 and is_robot_idle:
-                #             print("\n🎉 [HRI] Grab success! Passing the object to user")
-                #             current_hri_state = STATE_LOOKING_FOR_USER
-                #             hri_start_time = 0.0
-                
                 # -----------------------------------
                 # 状态 5：高精度 6-DoF AI 神经网络抓取 (Selected AI Grasp)
                 # -----------------------------------
                 elif current_hri_state == STATE_GRAB_OBJECT:
-                    
+
                     if hri_start_time == 0.0:
                         print("\n" + "="*50)
-                        print("🦾 [HRI] 状态 5: 开始执行【沿局部 Z 轴斜向直插】高阶控制流...")
+                        print("🦾 [HRI] State 5(Grab Object):Performing 【Along Local Z-Axis Oblique Insertion】High-Level Control Flow...")
                         
                         if hasattr(scene_mapper, 'selected_grasp') and scene_mapper.selected_grasp is not None:
                             # 拿到经过 45°自转、180°抄近道以及 4cm深插修正后的最终黄金抓取矩阵
@@ -1914,15 +1831,15 @@ def main():
                             # 记录我们要顺着轴线直插前进的总距离（悬停后退了多少，下探就要前进多少）
                             scene_mapper.local_stroke = HOVER_BACK_DIST
                             
-                            print(f"   🚀 [轴线悬停生成] 夹爪已顺着斜向角度后退 {HOVER_BACK_DIST*100}cm 设立炮台")
-                            print(f"      📍 悬停点位置: X={hover_x:.3f}, Y={hover_y:.3f}, Z={hover_z:.3f}")
+                            print(f"   🚀 [State 5 (Grab Object)]: Claw has retreated {HOVER_BACK_DIST*100}cm along the oblique angle to establish a firing position")
+                            print(f"      📍 Hover Point Position: X={hover_x:.3f}, Y={hover_y:.3f}, Z={hover_z:.3f}")
                         else:
-                            print("🚨 [错误] 未找到有效的 selected_grasp！")
+                            print("🚨 [Error] No valid selected_grasp found!")
                             current_hri_state = STATE_GAZE_INTERSECTION
                             continue
                         
                         # 3. 立刻派发第一阶段：飞往斜上方悬停点
-                        print("   -> 🛫 阶段 1：飞往斜上方轴线悬停点...")
+                        print("   -> 🛫 Step 1: Flying to the oblique axis hover point...")
                         if robot is not None:
                             robot.move_to(scene_mapper.hover_pose, speed=0.03) 
                             
@@ -1945,7 +1862,7 @@ def main():
                                 if robot is not None:
                                     robot.open_gripper(width=0.08) # 张开夹爪
                                     
-                                print(f"   -> 🛬 阶段 2：[姿态死锁] 开始顺着夹爪局部 Z 轴斜向直插 {scene_mapper.local_stroke*100:.1f}cm...")
+                                print(f"   -> 🛬 Step 2: [Pose Lock] Starting oblique insertion along the local Z-axis {scene_mapper.local_stroke*100:.1f}cm...")
                                 if robot is not None:
                                     # 🌟 核心调用：顺着指尖方向向前开火推进！
                                     robot.move_along_local_z(stroke_distance=scene_mapper.local_stroke, speed=0.015) 
@@ -1957,7 +1874,7 @@ def main():
                         # 阶段 3：到达底部，闭合夹爪 (保持你原有代码不变)
                         # -----------------------------------
                         elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 1.5 and is_robot_idle:
-                            print("   -> ✊ 阶段 3：接触目标，正在闭合夹爪...")
+                            print("   -> ✊ Step 3: Contacting the target, closing the gripper...")
                             if robot is not None:
                                 robot.close_gripper(force=15.0, speed=0.05) 
                                 
@@ -1965,21 +1882,58 @@ def main():
                             hri_start_time = time.time()
                             
                         # -----------------------------------
-                        # 阶段 4：抓稳后，垂直向上提拉 (为了安全退出，提拉依旧建议走纯世界系 Z 轴垂直向上)
+                        # 阶段 4：抓稳后垂直向上提拉，并执行【成功率物理闭环检测】
                         # -----------------------------------
-                        elif getattr(scene_mapper, 'grasp_step', 0) == 3 and time.time() - hri_start_time > 0.5: 
-                            print("   -> 🚀 阶段 4：垂直向上提拉物品，退出障碍区...")
+                        elif getattr(scene_mapper, 'grasp_step', 0) == 4 and time.time() - hri_start_time > 1.0 and is_robot_idle:
                             
-                            # 临时算一个世界坐标系正上方的提拉点
-                            curr_p, curr_r = robot.get_current_pose()
-                            if curr_p is not None:
-                                scene_mapper.lift_pose = [curr_p[0], curr_p[1], curr_p[2] + 0.18] + curr_r.tolist()
-                                if robot is not None:
-                                    robot.move_to(scene_mapper.lift_pose, speed=0.04) 
+                            # 🌟 真实物理判定：读取夹爪宽度
+                            current_width = 0.0
+                            if robot is not None:
+                                current_width = robot.get_gripper_width()
+                            
+                            # 如果夹爪间距大于 5 毫米，说明中间确实夹到了物体；
+                            # 如果小于 5 毫米，说明抓空了（夹爪完全闭合碰拢了）
+                            grasp_success = (current_width > 0.005) 
+                            
+                            if grasp_success:
+                                print(f"\n🎉 [HRI] Closed Loop Detection Passed (Current Gripper Width: {current_width*100:.1f}cm)，Object Successfully Grasped! Now delivering to user...")
+                                current_hri_state = STATE_LOOKING_FOR_USER
+                                hri_start_time = 0.0
+                            else:
+                                # ==========================================
+                                # 🚨 触发多级顺位降级重试防线
+                                # ==========================================
+                                current_retry = getattr(scene_mapper, 'grasp_retry_count', 0) + 1
+                                scene_mapper.grasp_retry_count = current_retry
                                 
-                            scene_mapper.grasp_step = 4
-                            hri_start_time = time.time()
-                            
+                                if current_retry < len(scene_mapper.tuned_grasps_pool):
+                                    print(f"\n⚠️ [HRI] Alert: Rank {current_retry} grasp attempt failed (Gripper Spacing: {current_width*100:.1f}cm, Possible Empty Grasp or Slipping)!")
+                                    print(f"🔄 Initiating automatic downgrade -> Continuing to the next highest backup pose with score {current_retry + 1}...")
+                                    
+                                    # 1. Must open the gripper first to avoid crashing into objects with the closed gripper
+                                    if robot is not None:
+                                        robot.open_gripper(width=0.08)
+                                        
+                                    # 2. Retrieve the next golden matrix from the pool
+                                    scene_mapper.selected_grasp = scene_mapper.tuned_grasps_pool[current_retry]
+                                    
+                                    # 3. A highly sophisticated step: Reset internal steps to 0 and clear the timer 
+                                    scene_mapper.grasp_step = 0
+                                    hri_start_time = 0.0  # 🌟 强制状态机在下一帧原地复活，从新姿态的轴线悬停（阶段1）重新起跑！
+                                    
+                                else:
+                                    # 试满 3 个点（或把池子里搜到的点全试完）都失败了
+                                    print(f"\n❌ [HRI] Alert: All {len(scene_mapper.tuned_grasps_pool)} golden poses failed! Triggering a veto.")
+                                    print("🔄 Abandoning the current grasping task. Automatically opening the gripper and returning to the gaze selection state (State 4)...")
+                                    
+                                    if robot is not None:
+                                        robot.open_gripper(width=0.08)
+                                        robot.move_to(READY_FOR_PASSING_POSE, speed=0.05) # 安全退回准备位
+                                        
+                                    # 清除策略残影，彻底退回
+                                    scene_mapper.selected_grasp = None
+                                    current_hri_state = STATE_GAZE_INTERSECTION
+                                    hri_start_time = 0.0
                         # -----------------------------------
                         # 任务完成
                         # -----------------------------------
@@ -2054,10 +2008,10 @@ def main():
                 # 状态 6：等待手掌进入工作空间 -> 翻转为递送姿势
                 # -----------------------------------
                 elif current_hri_state == STATE_LOOKING_FOR_USER:
-                    
+
                     if hri_start_time == 0.0:
                         print("\n" + "="*50)
-                        print("🤖 [HRI] 状态 6: 抓取成功！等待用户将手伸入工作空间...")
+                        print("🤖 [HRI] State 6(Waiting for User): Grabbed object successfully! Now looking for user's hand...")
                         
                         hri_start_time = time.time()
                         scene_mapper.looking_step = 1 # 阶段1：等待手掌；阶段2：等待姿态翻转
@@ -2080,7 +2034,7 @@ def main():
                                 WORKSPACE_RADIUS = 1.0
                                 
                                 if dist_to_base < WORKSPACE_RADIUS:
-                                    print(f"🎯 [HRI] 检测到手掌已进入工作空间 (距离: {dist_to_base:.2f}m)！正在翻转夹爪至向下递送姿态...")
+                                    print(f"🎯 [HRI] Detected hand entering workspace (Distance: {dist_to_base:.2f}m)! Initiating gripper flip to downward delivery pose...")
                                     
                                     # 🌟 触发移动到夹爪向下的准备姿态
                                     if robot is not None:
@@ -2092,7 +2046,7 @@ def main():
                             else:
                                 # 如果一直没收到坐标，每 10 秒提醒一次
                                 if time.time() - hri_start_time > 10.0:
-                                    print("⚠️ [HRI] 请在 HoloLens 中开启手掌追踪，并将手伸向机械臂...")
+                                    print("⚠️ [HRI] Please enable hand tracking in HoloLens and extend your hand towards the robot...")
                                     hri_start_time = time.time()
                                         
                         # -----------------------------------
@@ -2101,7 +2055,7 @@ def main():
                         elif getattr(scene_mapper, 'looking_step', 1) == 2:
                             # 确保翻转动作已经走完，并且稍微给 1 秒冗余时间防抖
                             if is_robot_idle and (time.time() - hri_start_time > 1.0):
-                                print("✅ [HRI] 已到达向下递送姿态，切入动态追踪 (状态 7)！")
+                                print("✅ [HRI] Has reached downward delivery pose, switching to dynamic tracking (State 7)!")
                                 current_hri_state = STATE_TRACKING_AND_PASS
                                 hri_start_time = 0.0
 
@@ -2116,7 +2070,7 @@ def main():
                         hri_start_time = time.time()
                         handover_dwell_start = 0.0
                         scene_mapper.pass_step = 0  
-                        print("🚀 [HRI] 正在向您的手掌上方移动...")
+                        print("🚀 [HRI] State 7: Dynamically tracking user's hand...")
 
                     # =========================================================
                     # 阶段 0：3D 伺服追踪，直到在手掌上方稳定停留
@@ -2131,7 +2085,7 @@ def main():
                             if dist_to_base > SAFE_RADIUS:
                                 # 如果手超出了范围，且机械臂还在伺服，立刻刹停
                                 if robot is not None and getattr(robot, 'is_servoing', False):
-                                    print(f"⚠️ [HRI] 手掌超出安全工作空间 ({dist_to_base:.2f}m > {SAFE_RADIUS}m)！暂停追踪。")
+                                    print(f"⚠️ [HRI] Hand is outside the safe workspace ({dist_to_base:.2f}m > {SAFE_RADIUS}m)! Pausing tracking.")
                                     robot.stop_servoing()
                                     handover_dwell_start = 0.0 # 读秒清零
                                     if T_M is not None:
@@ -2140,7 +2094,7 @@ def main():
                             else:
                                 # 如果之前被暂停了，现在手又乖乖回到安全范围内了，恢复追踪！
                                 if robot is not None and not getattr(robot, 'is_servoing', False):
-                                    print(f"✅ [HRI] 手掌回到安全范围 ({dist_to_base:.2f}m)，恢复伺服追踪！")
+                                    print(f"✅ [HRI] Hand is back in the safe range ({dist_to_base:.2f}m), resuming servo tracking!")
                                     robot.start_servoing()
                                     
                                 ee_pos, ee_quat = robot_listener.get_current_pose() # 🌟 确保获取 ee_quat
@@ -2167,14 +2121,14 @@ def main():
                                     if handover_dwell_start == 0.0:
                                         if dist_to_target < 0.06:
                                             handover_dwell_start = time.time()
-                                            print("⏳ [HRI] 机械臂已就位，请保持手部稳定 1 秒钟...")
+                                            print("⏳ [HRI] Robot is in position, please keep your hand stable for 1 second...")
                                     else:
                                         if dist_to_target > 0.10:
-                                            print("⚠️ [HRI] 目标大幅移动，打断稳定计时，重新追踪...")
+                                            print("⚠️ [HRI] Target moved significantly, interrupting stability timer, resuming tracking...")
                                             handover_dwell_start = 0.0
                                             
                                         elif time.time() - handover_dwell_start >= 0.5:
-                                            print("⬇️ [HRI] 追踪稳定！停止伺服，开始缓慢下降并检测触碰...")
+                                            print("⬇️ [HRI] Tracking stable! Stopping servoing and initiating gentle descent...")
                                             
                                             if robot is not None:
                                                 robot.stop_servoing() 
@@ -2209,7 +2163,7 @@ def main():
                                 # 在匀速阶段记录基准力，此时受力极其稳定
                                 if not hasattr(scene_mapper, 'baseline_fz'):
                                     scene_mapper.baseline_fz = current_fz
-                                    print(f"⚖️ [HRI] 运动已平稳，记录基准受力: Fz = {current_fz:.2f}N")
+                                    print(f"⚖️ [HRI] Motion is stable, recording baseline force: Fz = {current_fz:.2f}N")
                                 
                                 delta_fz = abs(current_fz - scene_mapper.baseline_fz)
                                 
@@ -2217,7 +2171,7 @@ def main():
                                 FORCE_THRESHOLD = 3.5 
                                 if delta_fz > FORCE_THRESHOLD:
                                     force_triggered = True
-                                    print(f"🖐️ [HRI] 检测到接触力变化 (ΔFz={delta_fz:.2f}N)！用户已接稳！")
+                                    print(f"🖐️ [HRI] Force detected (ΔFz={delta_fz:.2f}N)！User has stabilized!")
                                     
                             except Exception as e:
                                 pass
@@ -2229,7 +2183,7 @@ def main():
                             if robot is not None:
                                 robot.path_queue.queue.clear() 
                                 
-                            print("🤝 [HRI] 成功移交，释放物品！")
+                            print("🤝 [HRI] Successully transferred, releasing object!")
                             time.sleep(0.2) 
                             
                             if robot is not None:
@@ -2252,8 +2206,8 @@ def main():
                         elif is_robot_idle:
                             # 注意：如果是前 0.5s 还没有路径进入队列，可能会误判 idle，所以要确保过了缓冲期
                             if time.time() - getattr(scene_mapper, 'descent_start_time', 0) > 0.5:
-                                print("⚠️ [HRI] 递送扑空！未检测到手部支撑。")
-                                print("🔄 [HRI] 取消释放，正在退回安全高度...")
+                                print("⚠️ [HRI] Delivery failed! Hand support not detected.")
+                                print("🔄 [HRI] Cancelling release, moving back to safe height...")
                                 
                                 ee_pos, ee_quat = robot_listener.get_current_pose()
                                 if ee_pos is not None:
@@ -2269,6 +2223,27 @@ def main():
                                 # 🧹 清理内存
                                 if hasattr(scene_mapper, 'baseline_fz'): del scene_mapper.baseline_fz
                                 if hasattr(scene_mapper, 'descent_start_time'): del scene_mapper.descent_start_time
+
+            # -------------------------------------------------
+            # 【全场最后】统一收集本帧最终状态，并安全同步给 HoloLens
+            # -------------------------------------------------
+            if is_HRI_Demo:  # 只有开启 Demo 模式才收集发送
+                if current_hri_state == STATE_SCAN_OBJECTS:
+                    current_sub_state = getattr(scene_mapper, 'scan_post_process', 0)
+                elif current_hri_state == STATE_GRAB_OBJECT:
+                    current_sub_state = getattr(scene_mapper, 'grasp_step', 0)
+                elif current_hri_state == STATE_LOOKING_FOR_USER:
+                    current_sub_state = getattr(scene_mapper, 'looking_step', 0)
+                elif current_hri_state == STATE_TRACKING_AND_PASS:
+                    current_sub_state = getattr(scene_mapper, 'pass_step', 0)
+                else:
+                    current_sub_state = 0
+
+                # 检查是否有任何改变，有则一并送出
+                if (current_hri_state != last_synced_state) or (current_sub_state != last_synced_sub_state):
+                    send_hri_status_packet(conn, current_hri_state, current_sub_state)
+                    last_synced_state = current_hri_state
+                    last_synced_sub_state = current_sub_state
 
 
     except Exception as e:

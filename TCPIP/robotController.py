@@ -14,6 +14,7 @@ except ImportError:
 import time
 import actionlib
 from geometry_msgs.msg import WrenchStamped
+from sensor_msgs.msg import JointState
 
 class RobotController:
     def __init__(self):
@@ -76,6 +77,14 @@ class RobotController:
         self.wrench_topic = "/franka_state_controller/F_ext"
         self.wrench_sub = rospy.Subscriber(self.wrench_topic, WrenchStamped, self._wrench_callback)
         print(f">> 正在监听末端受力话题: {self.wrench_topic}")
+
+        # ====================================================
+        # 🖐️【新增】夹爪状态 (Gripper Width) 专用变量
+        # ====================================================
+        self.current_gripper_width = 0.0
+        self.gripper_joint_topic = "/franka_gripper/joint_states"
+        self.gripper_sub = rospy.Subscriber(self.gripper_joint_topic, JointState, self._gripper_joint_callback)
+        print(f">> 正在监听夹爪状态话题: {self.gripper_joint_topic}")
 
         self.worker_thread = threading.Thread(target=self._tape_player_executor)
         self.worker_thread.setDaemon(True)
@@ -529,3 +538,23 @@ class RobotController:
         :return: [Fx, Fy, Fz, Tx, Ty, Tz] (单位：牛顿 / 牛·米)
         """
         return self.current_wrench
+    
+    def _gripper_joint_callback(self, msg):
+        """实时更新当前夹爪的真实物理宽度"""
+        try:
+            # 确保消息中包含手指关节数据
+            if 'panda_finger_joint1' in msg.name and 'panda_finger_joint2' in msg.name:
+                idx1 = msg.name.index('panda_finger_joint1')
+                idx2 = msg.name.index('panda_finger_joint2')
+                
+                # 两个手指的线性位移相加，即为夹爪的总物理张开宽度 (单位: 米)
+                self.current_gripper_width = msg.position[idx1] + msg.position[idx2]
+        except ValueError:
+            pass
+
+    def get_gripper_width(self):
+        """
+        获取夹爪当前真实的物理宽度
+        :return: 宽度值 (单位：米)。全开约为 0.08m，完全闭合为 0.0m。
+        """
+        return self.current_gripper_width
