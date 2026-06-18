@@ -10,8 +10,43 @@ from scipy.spatial.transform import Rotation as R
 from collections import deque
 import open3d as o3d
 from concurrent.futures import ThreadPoolExecutor
+import threading
+import select
 
 # netsh interface portproxy add v4tov4 listenaddress=192.168.137.1 listenport=[本地监听端口] connectaddress=[机械臂的Tailscale IP] connectport=[机械臂服务端口]
+
+tcp_send_lock = threading.Lock()
+def safe_send_packet(conn, packet, timeout_sec=1.0):
+    """
+    带熔断机制的绝对安全发送：
+    1. 保证不会发生粘包和碎包。
+    2. 如果对方停止接收超过 timeout_sec 秒，直接抛出异常熔断，绝不卡死主线程！
+    """
+    global tcp_send_lock
+    with tcp_send_lock:
+        conn.setblocking(False) # 始终保持非阻塞
+        total_sent = 0
+        packet_len = len(packet)
+        start_time = time.time()
+
+        while total_sent < packet_len:
+            # 使用 select 监听网卡，每次最多等 0.1 秒
+            _, writable, _ = select.select([], [conn], [], 0.1)
+            
+            # 🌟 熔断机制：如果等了 1 秒对方还没收走数据，直接抛弃对方！
+            if time.time() - start_time > timeout_sec:
+                raise ConnectionError("⏱️ [TCP 熔断] 发送超时！HoloLens 疑似卡死，强制丢弃包裹以保全机器人控制！")
+            
+            if writable:
+                try:
+                    # 能发多少发多少
+                    sent = conn.send(packet[total_sent:])
+                    total_sent += sent
+                except BlockingIOError:
+                    continue # 缓冲区满，下一圈接着试
+                except Exception as e:
+                    raise e # 网络真断了，向外抛出
+                
 
 # -------------------------------------------------
 # 1. 基础配置与加载
@@ -164,7 +199,13 @@ def send_T_M(conn, T_M):
     """发送变换矩阵 T_M"""
     try:
         flat_T_M = T_M.astype(np.float32).flatten()
-        conn.sendall(b't' + flat_T_M.tobytes())
+        try:
+            safe_send_packet(conn, b't' + flat_T_M.tobytes())
+        except ConnectionError as e:
+            print(e)
+            # 可以在这里做个标记，比如触发你在 main() 里的重连大循环
+        except Exception:
+            pass
         print("[TCP] ✅ Sent Transformation Matrix (T_M).")
     except Exception as e:
         print(f"[TCP] ❌ Error sending T_M: {e}")
@@ -197,8 +238,16 @@ def send_robot_ball_position(conn, robot_raw_pos, T_M):
         header = b'b'
         payload = struct.pack('<fff', unity_pos[0], unity_pos[1], unity_pos[2])
         full_packet = header + payload
-
-        conn.sendall(full_packet)
+        
+        # 新的安全代码
+        try:
+            safe_send_packet(conn, full_packet)
+        except ConnectionError as e:
+            print(e)
+            # 可以在这里做个标记，比如触发你在 main() 里的重连大循环
+            # 跳出内层 while 循环，重新等待 HoloLens 连接
+        except Exception:
+            pass
         print(f"   -> Sent Ball Pos: {unity_pos}")
 
         # ==================== 调试打印区 ====================
@@ -295,7 +344,15 @@ def send_skeleton_data(conn, send_coords):
         payload = struct.pack('<' + 'f' * len(flat_coords), *flat_coords)
         
         # 4. 发送
-        conn.sendall(header + payload)
+        # 新的安全代码
+        try:
+            safe_send_packet(conn, header+payload)
+        except ConnectionError as e:
+            print(e)
+            # 可以在这里做个标记，比如触发你在 main() 里的重连大循环
+            # 跳出内层 while 循环，重新等待 HoloLens 连接
+        except Exception:
+            pass
         # print(f"  -> Sent Skeleton Frame: 17 joints.") # 频率太高可以注释掉这行
         
     except Exception as e:
@@ -358,9 +415,15 @@ def send_path_to_hololens(conn, points, T_M):
         if not points or len(points) == 0:
             header = b'w'
             payload = struct.pack('<i', 0)
-            conn.setblocking(True)
-            conn.sendall(header + payload)
-            conn.setblocking(False)
+            # 新的安全代码
+            try:
+                safe_send_packet(conn, header+payload)
+            except ConnectionError as e:
+                print(e)
+                # 可以在这里做个标记，比如触发你在 main() 里的重连大循环
+                # 跳出内层 while 循环，重新等待 HoloLens 连接
+            except Exception:
+                pass
             return
 
         # 2. 坐标系转换 (Robot -> Unity)
@@ -385,9 +448,15 @@ def send_path_to_hololens(conn, points, T_M):
         payload += struct.pack(f'<{len(flat_coords)}f', *flat_coords)
 
         # 5. 发送数据 (极其重要：发数据前开启阻塞，发完关闭，这是非阻塞TCP的核心稳健写法)
-        conn.setblocking(True)
-        conn.sendall(header + payload)
-        conn.setblocking(False)
+        # 新的安全代码
+        try:
+            safe_send_packet(conn, header+payload)
+        except ConnectionError as e:
+            print(e)
+            # 可以在这里做个标记，比如触发你在 main() 里的重连大循环
+            # 跳出内层 while 循环，重新等待 HoloLens 连接
+        except Exception:
+            pass
 
     except BlockingIOError:
         pass # 非阻塞模式下的系统级等待，可以直接忽略
@@ -406,8 +475,16 @@ def send_hri_status_packet(conn, state_id, sub_state_id):
         payload = struct.pack('<ii', state_id, sub_state_id)
         
         conn.setblocking(True)
-        conn.sendall(header + payload)
-        conn.setblocking(False)
+        # 新的安全代码
+        try:
+            safe_send_packet(conn, header+payload)
+        except ConnectionError as e:
+            print(e)
+            # 可以在这里做个标记，比如触发你在 main() 里的重连大循环
+            # 跳出内层 while 循环，重新等待 HoloLens 连接
+        except Exception:
+            pass
+
         print(f"📢 [TCP] 状态全同步 -> Main: {state_id} | Sub: {sub_state_id}")
     except BlockingIOError:
         pass
@@ -456,9 +533,17 @@ def send_point_cloud_to_hololens(conn, pcd, T_M):
         count_bytes = struct.pack('<i', len(unity_points))
         payload_bytes = payload_data.tobytes() # 自动转为小端序的 bytes
         
-        conn.setblocking(True)
-        conn.sendall(header + count_bytes + payload_bytes)
-        conn.setblocking(False)
+        # 新的安全代码
+        try:
+            safe_send_packet(conn, header+count_bytes+payload_bytes, timeout_sec=5.0)
+        except ConnectionError as e:
+            print(f"💥 [TCP] 点云发送超时或断开: {e}")
+            # 🌟 致命防线：既然没发完，TCP 流已经错位了！
+            # 绝对不能 pass！必须向上抛出异常，让主程序的 except 捕获并重启连接！
+            raise e
+        except Exception:
+            pass
+
         
         print(f"☁️ [TCP] 已向 HoloLens 发送对齐点云，总计: {len(unity_points)} 点 ({len(payload_bytes)/1024:.1f} KB)")
         
@@ -552,8 +637,8 @@ def main():
     # ====== Multipointcloud test ======
     # 这里使用的是 [x, y, z, qx, qy, qz, qw] 或关节角，只要符合你的 robot.move_to 格式即可
 
-    SCAN_START_POSE = [0.5792, 0.2653, 0.5375, 0.91, -0.42, 0.04, -0.02]
-    SCAN_END_POSE   = [0.5621, -0.1739, 0.5375, -0.92, 0.38, -0.04, -0.01] #[INFO] [1777634168.026776]: sent #149 UPDATED d=0.000223 xyz=(0.5621, -0.1739, 0.5610) Euler[Deg]=(Rx:-179.5, Ry:-4.6, Rz:-45.0) q=(-0.92, 0.38, -0.04, -0.01)
+    SCAN_START_POSE = [0.5000, 0.2700, 0.5, 0.91, -0.42, 0.04, -0.02]
+    SCAN_END_POSE   = [0.5000, -0.1800, 0.5, -0.92, 0.38, -0.04, -0.01] #[INFO] [1777634168.026776]: sent #149 UPDATED d=0.000223 xyz=(0.5621, -0.1739, 0.5610) Euler[Deg]=(Rx:-179.5, Ry:-4.6, Rz:-45.0) q=(-0.92, 0.38, -0.04, -0.01)
     SCAN_STEPS = 6  # 直线上拍 4 张照片（起点、2个中间点、终点）
 
     SCAN_ARC_HEIGHT = 0.04
@@ -841,7 +926,15 @@ def main():
                                     time.sleep(0.1) # 每 100ms 检查一次，避免占用过多 CPU
 
                                 try:
-                                    conn.sendall(b'm')
+                                    # 新的安全代码
+                                    try:
+                                        safe_send_packet(conn, b'm')
+                                    except ConnectionError as e:
+                                        print(e)
+                                        # 可以在这里做个标记，比如触发你在 main() 里的重连大循环
+                                        # 跳出内层 while 循环，重新等待 HoloLens 连接
+                                    except Exception:
+                                        pass
                                     print("   ✅ [TCP] Robot motion completed, 'm' unlock signal sent to HoloLens")
                                 except Exception as e:
                                     print(f"   ❌ Failed to send completion signal: {e}")
@@ -937,7 +1030,15 @@ def main():
                                     time.sleep(0.1) # 每 100ms 检查一次，避免占用过多 CPU
 
                                 try:
-                                    conn.sendall(b'm')
+                                    # 新的安全代码
+                                    try:
+                                        safe_send_packet(conn, b'm')
+                                    except ConnectionError as e:
+                                        print(e)
+                                        # 可以在这里做个标记，比如触发你在 main() 里的重连大循环
+                                        # 跳出内层 while 循环，重新等待 HoloLens 连接
+                                    except Exception:
+                                        pass
                                     print("   ✅ [TCP] Robot force control motion completed, 'm' unlock signal sent to HoloLens")
                                 except Exception as e:
                                     print(f"   ❌ Failed to send completion signal: {e}")
@@ -1140,9 +1241,9 @@ def main():
 
                             if not should_quit and skeleton_coord_unity:
                                 # 6. 截取前 17 个身体关键点 (丢掉后面的手部点)
-                                body_only_coords = skeleton_coord_unity[:17]
-                                
-                                send_skeleton_data(conn, body_only_coords)
+                                if len(skeleton_coord_unity) >= 17:
+                                    body_only_coords = skeleton_coord_unity[:17]
+                                    send_skeleton_data(conn, body_only_coords)
                                 
                         else:
                             # 防止疯狂打印，可以加个简单的限流，或者只提醒一次
@@ -1188,9 +1289,16 @@ def main():
                         header_j = b'j'
                         payload_j = struct.pack('<64f', *flat_data)
 
-                        conn.setblocking(True)
-                        conn.sendall(header_j + payload_j)
-                        conn.setblocking(False)
+                        # 新的安全代码
+                        try:
+                            safe_send_packet(conn, header_j+payload_j)
+                        except ConnectionError as e:
+                            print(e)
+                            # 可以在这里做个标记，比如触发你在 main() 里的重连大循环
+                            # 跳出内层 while 循环，重新等待 HoloLens 连接
+                        except Exception:
+                            pass
+
 
                         
                     except Exception as e:
@@ -1587,17 +1695,28 @@ def main():
                         
                         # ==========================================
                         if current_pt is not None and T_M is not None:
-                            try:
-                                u_pt = rut.robot2unity_transform(current_pt, T_M)
-                                
-                                packet_p = b't' + struct.pack('<fff', u_pt[0], u_pt[1], u_pt[2])
-                                
-                                # ⚠️ TCP 关键：发送前必须开启阻塞，发完再关掉！
-                                conn.setblocking(True)
-                                conn.sendall(packet_p)
-                                conn.setblocking(False)
-                            except Exception as e:
-                                print(f"⚠️ [TCP] State 4 (Gaze Intersection)]: Failed to send cursor position: {e}")
+                            current_time = time.time()
+                            # 利用 scene_mapper 存一下上次发送的时间，避免报错
+                            last_send = getattr(scene_mapper, 'last_cursor_send_time', 0.0)
+                            
+                            # 每隔 0.033 秒 (30Hz) 才允许发送一次
+                            if current_time - last_send > 0.033:
+                                try:
+                                    u_pt = rut.robot2unity_transform(current_pt, T_M)
+                                    packet_p = b't' + struct.pack('<fff', u_pt[0], u_pt[1], u_pt[2])
+                                    # 新的安全代码
+                                    try:
+                                        safe_send_packet(conn, packet_p)
+                                    except ConnectionError as e:
+                                        print(e)
+                                        # 可以在这里做个标记，比如触发你在 main() 里的重连大循环
+                                        # 跳出内层 while 循环，重新等待 HoloLens 连接
+                                    except Exception:
+                                        pass
+                                    # 记录发送时间
+                                    scene_mapper.last_cursor_send_time = current_time
+                                except Exception as e:
+                                    pass
                         # ==========================================
 
                         if time.time() - debug_print_time > 0.5:
@@ -1674,25 +1793,25 @@ def main():
                                             # 2. 计算有向包围盒 (OBB)
                                             obb = single_box_pcd.get_oriented_bounding_box()
 
-                                            # =======================================================
-                                            # 🌟【修改 2】残影消除：把这个盒子从全局记忆地图中抹除！
-                                            # =======================================================
-                                            # 稍微放大一下 OBB (比如 1.2 倍)，确保边缘和底部的噪点也能被包裹进去
-                                            eraser_obb = o3d.geometry.OrientedBoundingBox(obb)
-                                            eraser_obb.scale(1.2, eraser_obb.center)
+                                            # # =======================================================
+                                            # # 🌟【修改 2】残影消除：把这个盒子从全局记忆地图中抹除！
+                                            # # =======================================================
+                                            # # 稍微放大一下 OBB (比如 1.2 倍)，确保边缘和底部的噪点也能被包裹进去
+                                            # eraser_obb = o3d.geometry.OrientedBoundingBox(obb)
+                                            # eraser_obb.scale(1.2, eraser_obb.center)
                                             
-                                            # 获取全局地图中，落在这个“橡皮擦盒子”里的所有点的索引
-                                            ghost_indices = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.global_pcd.points)
+                                            # # 获取全局地图中，落在这个“橡皮擦盒子”里的所有点的索引
+                                            # ghost_indices = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.global_pcd.points)
                                             
-                                            # 使用 invert=True 进行反向提取，相当于把这些点“抠除”
-                                            scene_mapper.global_pcd = scene_mapper.global_pcd.select_by_index(ghost_indices, invert=True)
+                                            # # 使用 invert=True 进行反向提取，相当于把这些点“抠除”
+                                            # scene_mapper.global_pcd = scene_mapper.global_pcd.select_by_index(ghost_indices, invert=True)
                                             
-                                            # 同步把这个物体从“磁铁”点云中剔除，防止接下来发生重复吸附
-                                            ghost_indices_obj = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.objects_pcd.points)
-                                            scene_mapper.objects_pcd = scene_mapper.objects_pcd.select_by_index(ghost_indices_obj, invert=True)
+                                            # # 同步把这个物体从“磁铁”点云中剔除，防止接下来发生重复吸附
+                                            # ghost_indices_obj = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.objects_pcd.points)
+                                            # scene_mapper.objects_pcd = scene_mapper.objects_pcd.select_by_index(ghost_indices_obj, invert=True)
                                             
-                                            print(f"🧹 [State 4 (Gaze Intersection)]: Successfully removed ghost points of box {box_id} from the global point cloud map!")
-                                            # =======================================================
+                                            # print(f"🧹 [State 4 (Gaze Intersection)]: Successfully removed ghost points of box {box_id} from the global point cloud map!")
+                                            # # =======================================================
 
                                             # 3. 获取真正的几何中心 (这比 np.mean 准得多！)
                                             box_center = obb.center
@@ -1713,7 +1832,7 @@ def main():
                                         # 🪐【重构筛选】多目标优选 —— 提取前3名顺位黄金抓取姿态
                                         # =======================================================
                                         if hasattr(scene_mapper, 'ai_grasps') and scene_mapper.ai_grasps is not None and len(scene_mapper.ai_grasps) > 0:
-                                            CANDIDATE_POOL_LIMIT = 40 
+                                            CANDIDATE_POOL_LIMIT = 200 
                                             candidates_scored = [] # 新增：用于存放所有合法姿态的临时列表
                                             
                                             # 1. 第一轮过滤与双标大评分
@@ -1744,6 +1863,28 @@ def main():
                                             top_3_candidates = candidates_scored[:3]
                                             
                                             if len(top_3_candidates) > 0:
+
+                                                eraser_obb = o3d.geometry.OrientedBoundingBox(obb)
+                                                eraser_obb.scale(1.2, eraser_obb.center)
+                                                
+                                                # 1. 删 Global Map
+                                                ghost_indices = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.global_pcd.points)
+                                                scene_mapper.global_pcd = scene_mapper.global_pcd.select_by_index(ghost_indices, invert=True)
+                                                
+                                                # 2. 删 Object Map
+                                                ghost_indices_obj = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.objects_pcd.points)
+                                                ghost_indices_np = np.asarray(ghost_indices_obj) # 必须转为 numpy
+                                                
+                                                # 3. 🌟 绝对同步删 Labels (必须在更新 objects_pcd 之前做！)
+                                                mask = np.ones(len(scene_mapper.object_labels), dtype=bool)
+                                                mask[ghost_indices_np] = False
+                                                scene_mapper.object_labels = scene_mapper.object_labels[mask]
+                                                
+                                                # 4. 最后更新 objects_pcd，保证 1:1 对齐
+                                                scene_mapper.objects_pcd = scene_mapper.objects_pcd.select_by_index(ghost_indices_obj, invert=True)
+
+                                                print(f"🧹 顺位筛选通过！已从记忆地图中抹除该物品的残影。")
+
                                                 scene_mapper.tuned_grasps_pool = [] # 🌟 新增：存放微调后的前3顺位矩阵池
                                                 
                                                 print(f"\n🎯 [多目标筛选] 针对当前目标成功锁定 {len(top_3_candidates)} 个顺位备份姿态:")
@@ -1787,10 +1928,17 @@ def main():
                                                 scene_mapper.target_box_points = box_points
                                                 current_hri_state = STATE_GRAB_OBJECT 
                                                 hri_start_time = 0.0
-                                                
+                                            
                                             else:
-                                                print(f"⚠️ [Not Matched] No valid grasp candidates found for the selected box {box_id}. Please try again.")
+                                                # 🌟 如果没找到合适姿态，什么数组都不删，直接让他重试！
+                                                print(f"⚠️ [Not Matched] 没有为该物体找到安全的抓取姿态，放弃抓取。请看向其他物体！")
                                                 scene_mapper.selected_grasp = None
+                                                fixation_point = None
+                                                fixation_start_time = time.time()
+                                            
+                                        else:
+                                            print(f"⚠️ [Not Matched] No valid grasp candidates found for the selected box {box_id}. Please try again.")
+                                            scene_mapper.selected_grasp = None
                                 else:
                                     fixation_point = current_pt
                                     fixation_start_time = time.time()
@@ -1841,7 +1989,7 @@ def main():
                         # 3. 立刻派发第一阶段：飞往斜上方悬停点
                         print("   -> 🛫 Step 1: Flying to the oblique axis hover point...")
                         if robot is not None:
-                            robot.move_to(scene_mapper.hover_pose, speed=0.03) 
+                            robot.move_to(scene_mapper.hover_pose, speed=0.06) 
                             
                         scene_mapper.grasp_step = 1       
                         hri_start_time = time.time()
@@ -1865,24 +2013,40 @@ def main():
                                 print(f"   -> 🛬 Step 2: [Pose Lock] Starting oblique insertion along the local Z-axis {scene_mapper.local_stroke*100:.1f}cm...")
                                 if robot is not None:
                                     # 🌟 核心调用：顺着指尖方向向前开火推进！
-                                    robot.move_along_local_z(stroke_distance=scene_mapper.local_stroke, speed=0.015) 
+                                    robot.move_along_local_z(stroke_distance=scene_mapper.local_stroke, speed=0.1) 
                                     
                                 scene_mapper.grasp_step = 2
                                 hri_start_time = time.time()
                                 
                         # -----------------------------------
-                        # 阶段 3：到达底部，闭合夹爪 (保持你原有代码不变)
+                        # 阶段 3：到达底部，闭合夹爪 
                         # -----------------------------------
-                        elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 1.5 and is_robot_idle:
+                        elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 3.0 and is_robot_idle:
                             print("   -> ✊ Step 3: Contacting the target, closing the gripper...")
                             if robot is not None:
                                 robot.close_gripper(force=15.0, speed=0.05) 
-                                
+                            
                             scene_mapper.grasp_step = 3
                             hri_start_time = time.time()
                             
                         # -----------------------------------
-                        # 阶段 4：抓稳后垂直向上提拉，并执行【成功率物理闭环检测】
+                        # 阶段 4：抓稳后垂直向上提拉，退出障碍区 (你缺失的提拉部分)
+                        # -----------------------------------
+                        elif getattr(scene_mapper, 'grasp_step', 0) == 3 and time.time() - hri_start_time > 0.5: 
+                            print("   -> 🚀 Step 4: Lifting up object...")
+                            
+                            # 临时算一个世界坐标系正上方的提拉点
+                            curr_p, curr_r = robot.get_current_pose()
+                            if curr_p is not None:
+                                scene_mapper.lift_pose = [curr_p[0], curr_p[1], curr_p[2] + 0.18] + curr_r.tolist()
+                                if robot is not None:
+                                    robot.move_to(scene_mapper.lift_pose, speed=0.06) 
+                                    
+                            scene_mapper.grasp_step = 4
+                            hri_start_time = time.time()
+                            
+                        # -----------------------------------
+                        # 阶段 5：提拉完成后，执行【成功率物理闭环检测】与顺位降级
                         # -----------------------------------
                         elif getattr(scene_mapper, 'grasp_step', 0) == 4 and time.time() - hri_start_time > 1.0 and is_robot_idle:
                             
@@ -1893,10 +2057,10 @@ def main():
                             
                             # 如果夹爪间距大于 5 毫米，说明中间确实夹到了物体；
                             # 如果小于 5 毫米，说明抓空了（夹爪完全闭合碰拢了）
-                            grasp_success = (current_width > 0.005) 
+                            grasp_success = (current_width > 0.020) 
                             
                             if grasp_success:
-                                print(f"\n🎉 [HRI] Closed Loop Detection Passed (Current Gripper Width: {current_width*100:.1f}cm)，Object Successfully Grasped! Now delivering to user...")
+                                print(f"\n🎉 [HRI] 物理闭环检测通过 (当前握持宽: {current_width*100:.1f}cm)，物品已成功抓稳！正在递送给用户...")
                                 current_hri_state = STATE_LOOKING_FOR_USER
                                 hri_start_time = 0.0
                             else:
@@ -1907,24 +2071,24 @@ def main():
                                 scene_mapper.grasp_retry_count = current_retry
                                 
                                 if current_retry < len(scene_mapper.tuned_grasps_pool):
-                                    print(f"\n⚠️ [HRI] Alert: Rank {current_retry} grasp attempt failed (Gripper Spacing: {current_width*100:.1f}cm, Possible Empty Grasp or Slipping)!")
-                                    print(f"🔄 Initiating automatic downgrade -> Continuing to the next highest backup pose with score {current_retry + 1}...")
+                                    print(f"\n⚠️ [HRI] 警报：顺位第 {current_retry} 次抓取判定失败（夹爪间距 {current_width*100:.1f}cm，疑似抓空或滑落）！")
+                                    print(f"🔄 启动自动降级 -> 顺位延续至得分第 {current_retry + 1} 高的备份姿态...")
                                     
-                                    # 1. Must open the gripper first to avoid crashing into objects with the closed gripper
+                                    # 1. 必须先松开夹爪，避免带着闭合的夹爪去对齐新姿态撞坏物品
                                     if robot is not None:
                                         robot.open_gripper(width=0.08)
                                         
-                                    # 2. Retrieve the next golden matrix from the pool
+                                    # 2. 从池子里捞出顺位延续的下一个黄金矩阵
                                     scene_mapper.selected_grasp = scene_mapper.tuned_grasps_pool[current_retry]
                                     
-                                    # 3. A highly sophisticated step: Reset internal steps to 0 and clear the timer 
+                                    # 3. 极其精妙的一步：重置内部步骤为 0，将计时器清零
                                     scene_mapper.grasp_step = 0
-                                    hri_start_time = 0.0  # 🌟 强制状态机在下一帧原地复活，从新姿态的轴线悬停（阶段1）重新起跑！
+                                    hri_start_time = 0.0  # 🌟 强制状态机在下一帧原地复活
                                     
                                 else:
                                     # 试满 3 个点（或把池子里搜到的点全试完）都失败了
-                                    print(f"\n❌ [HRI] Alert: All {len(scene_mapper.tuned_grasps_pool)} golden poses failed! Triggering a veto.")
-                                    print("🔄 Abandoning the current grasping task. Automatically opening the gripper and returning to the gaze selection state (State 4)...")
+                                    print(f"\n❌ [HRI] 终极警报：顺位前 {len(scene_mapper.tuned_grasps_pool)} 的黄金姿态全部尝试失败！触发一票否决。")
+                                    print("🔄 放弃本次抓取任务。自动张开夹爪并退回眼动选择状态 (State 4)...")
                                     
                                     if robot is not None:
                                         robot.open_gripper(width=0.08)
@@ -1934,6 +2098,7 @@ def main():
                                     scene_mapper.selected_grasp = None
                                     current_hri_state = STATE_GAZE_INTERSECTION
                                     hri_start_time = 0.0
+# ... existing code ...
                         # -----------------------------------
                         # 任务完成
                         # -----------------------------------

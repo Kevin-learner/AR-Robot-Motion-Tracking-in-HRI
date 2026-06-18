@@ -35,7 +35,7 @@ def request_grasps_from_graspnet(pcd_points, pcd_colors, cam_K_matrix, server_ip
     try:
         print(f"🚀 正在上传数据 (点云数: {len(pcd_points)})...")
         # 超时时间设长一点，网络推理需要时间
-        response = requests.post(url, data=memfile.read(), timeout=20.0) 
+        response = requests.post(url, data=memfile.read(), timeout=30.0) 
         
         if response.status_code == 200:
             result_file = io.BytesIO(response.content)
@@ -44,7 +44,7 @@ def request_grasps_from_graspnet(pcd_points, pcd_colors, cam_K_matrix, server_ip
             save_path = "test_output_grasps.npy"
             np.save(save_path, grasps)
             
-            print(f"🎉 成功拿到 {grasps.shape[0]} 个 AI 抓取姿态！")
+            print(f" Successfully obtain {grasps.shape[0]} AI interfered Grasps")
             return grasps
         else:
             print(f"❌ 4060 服务端报错，状态码: {response.status_code}")
