@@ -217,29 +217,41 @@ class RobotController:
 
             # --- 🌟 优先级 2：全新 3D 伺服递送模式 (追击手部) ---
             elif self.is_servoing and self.servo_target_p is not None and self.current_cmd_p is not None:
-                # 1. 计算误差向量 (目标点 - 当前指令点)
+                # ==========================
+                # 1. 处理位置平移 (Translation)
+                # ==========================
                 err_vec = self.servo_target_p - self.current_cmd_p
-                
-                # 2. 计算目标速度 (P 控制)
                 target_vel = self.Kp_servo * err_vec
                 
-                # 3. 速度限幅 (防止手动得太快，机械臂猛冲)
                 speed = np.linalg.norm(target_vel)
                 if speed > self.max_servo_vel:
                     target_vel = target_vel * (self.max_servo_vel / speed)
                 
-                # 4. 积分得到下一帧的平滑位置
                 self.current_cmd_p += target_vel * dt
                 
-                # 5. 填装发布信息 (注意：姿态死死锁定为 start_servoing 时的姿态！)
+                # ==========================
+                # 2. 处理姿态平滑旋转 (Rotation - Slerp)
+                # ==========================
+                # 设定一个旋转的追踪灵敏度，相当于旋转的 Kp (可根据需要调，2.0~5.0 比较平滑)
+                rot_kp = 3.0 
+                # 计算步长因子 t，确保不超调 (最大为 1.0)
+                t = min(rot_kp * dt, 1.0) 
+                
+                # 使用 ROS 的球面线性插值，让姿态丝滑过渡
+                # 确保你文件开头有: from tf.transformations import quaternion_slerp
+                self.current_cmd_r = quaternion_slerp(self.current_cmd_r, self.servo_target_r, t)
+
+                # ==========================
+                # 3. 填装发布信息
+                # ==========================
                 msg.pose.position.x = self.current_cmd_p[0]
                 msg.pose.position.y = self.current_cmd_p[1]
                 msg.pose.position.z = self.current_cmd_p[2]
                 
-                msg.pose.orientation.x = self.servo_target_r[0]
-                msg.pose.orientation.y = self.servo_target_r[1]
-                msg.pose.orientation.z = self.servo_target_r[2]
-                msg.pose.orientation.w = self.servo_target_r[3]
+                msg.pose.orientation.x = self.current_cmd_r[0] # 🌟 使用插值后的平滑姿态
+                msg.pose.orientation.y = self.current_cmd_r[1]
+                msg.pose.orientation.z = self.current_cmd_r[2]
+                msg.pose.orientation.w = self.current_cmd_r[3]
                 
                 should_publish = True
             
@@ -297,7 +309,7 @@ class RobotController:
 
     def start_tracking(self):
         """开启炮台跟踪模式"""
-        print("⏳ [Robot] 收到 start_tracking 调用，正在获取起始位姿...")
+        print("⏳ [Robot] Receiving tracking start command...")
         p, r = self.get_current_pose()
         if p is not None:
             # 锁定起步坐标！在接下来的追踪中，机械臂其实是以这个位姿为刚体转动的
@@ -311,14 +323,14 @@ class RobotController:
             with self.path_queue.mutex:
                 self.path_queue.queue.clear()
             self.is_tracking = True
-            print("👁️ [Robot] 成功！炮台跟踪模式已启动！(仅旋转 Joint 1)")
+            print("👁️ [Robot] Success! Tracking mode started! (Only rotating Joint 1)")
         else:
-            print("❌ [Robot] 获取起始位姿失败！")
+            print("❌ [Robot] Unable to get current pose, cannot start tracking.")
 
     def stop_tracking(self):
         """停止跟踪模式"""
         self.is_tracking = False
-        print("🛑 [Robot] 视觉 PID 跟踪已停止")
+        print("🛑 [Robot] Stopped tracking mode.")
 
     def update_tracking_error(self, err_x, err_y, err_z=0.0):
         """更新图像误差"""
@@ -499,6 +511,7 @@ class RobotController:
             self.servo_target_p = p.copy()
             self.servo_target_r = r.copy() 
             self.current_cmd_p = p.copy()  # 初始化内部平滑指令
+            self.current_cmd_r = r.copy()  # 🌟 新增：记录当前姿态指令
             
             with self.path_queue.mutex:
                 self.path_queue.queue.clear() # 清空所有旧路径
@@ -513,13 +526,27 @@ class RobotController:
         self.is_servoing = False
         print("🛑 [Robot] 3D 伺服递送已停止")
 
-    def update_servo_target(self, target_pos):
+    def update_servo_target(self, target_pose):
         """
-        更新 3D 伺服的目标点 (绝对物理坐标)
-        :param target_pos: 机器人坐标系下的目标 [X, Y, Z]
+        更新 3D/6D 伺服的目标点 (绝对物理坐标与姿态)
+        :param target_pose: 机器人坐标系下的目标。
+                            支持格式 1 (向下兼容): [X, Y, Z]
+                            支持格式 2 (全向位姿): [X, Y, Z, Qx, Qy, Qz, Qw]
         """
-        if self.is_servoing and target_pos is not None:
-            self.servo_target_p = np.array(target_pos)
+        if self.is_servoing and target_pose is not None:
+            target_array = np.array(target_pose)
+            
+            # 1. 兼容旧版：仅传入 3 维平移坐标
+            if len(target_array) == 3:
+                self.servo_target_p = target_array
+                
+            # 2. 升级版：传入 7 维完整位姿 (3D位置 + 4D四元数)
+            elif len(target_array) == 7:
+                self.servo_target_p = target_array[:3]
+                self.servo_target_r = target_array[3:] # 更新目标姿态
+                
+            else:
+                print(f"⚠️ [Robot] update_servo_target 接收到无效的数据长度: {len(target_array)}，请确保传入 3 维或 7 维列表！")
     
     def _wrench_callback(self, msg):
         """实时更新当前末端受力"""

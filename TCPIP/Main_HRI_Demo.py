@@ -178,6 +178,12 @@ try:
 except ImportError:
     print("⚠️ Warning: request_grasps.py not found. No way to compute grasp pose.")
 
+try:
+    from yolo_detector import YoloGraspDetector
+except ImportError:
+    print("⚠️ Warning: yolo_detector.py not found. No way to compute grasp pose with YOLO.")
+    YoloGraspDetector = None
+
 
 # -------------------------------------------------
 # 2. 核心与辅助函数
@@ -500,7 +506,7 @@ def send_point_cloud_to_hololens(conn, pcd, T_M):
         if pcd is None or pcd.is_empty(): return
         
         # 1. 体素降采样 (极其重要！设置 1cm，既能看清形状，又能把点数压缩到 1万~3万点以内)
-        downsampled_pcd = pcd.voxel_down_sample(voxel_size=0.01)
+        downsampled_pcd = pcd.voxel_down_sample(voxel_size=0.005)
         
         points = np.asarray(downsampled_pcd.points)
         # 如果有点云颜色则提取，没有就默认白色
@@ -570,6 +576,8 @@ def main():
     #Initialize the RVIZ visualizer
     rviz_broadcaster = RvisSkeletonBroacaster.RVizSkeletonBroadcaster(frame_id="panda_link0")
 
+  # 初始化 YOLO 检测器
+    yolo_detector = YoloGraspDetector(weights_path="checkpoints/yolo_weights.pt", conf=0.30)
 
     sSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -605,6 +613,7 @@ def main():
     STATE_SCAN_OBJECTS = 3   # 3. 扫描桌面物品
     STATE_GAZE_INTERSECTION = 4 # 4. gaze selection
     STATE_GRAB_OBJECT = 5       # 5. 抓取物品
+    STATE_GRAB_OBJECT_YOLO = 51 # 51. 使用 YOLO 模型抓取物品
     STATE_LOOKING_FOR_USER = 6     # 6. 寻找用户来拿
     STATE_TRACKING_AND_PASS = 7     # 7. 跟踪并递给用户
     
@@ -1926,7 +1935,9 @@ def main():
                                                 scene_mapper.grasp_retry_count = 0  # 🌟 新增：重试计数器归零
                                                 
                                                 scene_mapper.target_box_points = box_points
-                                                current_hri_state = STATE_GRAB_OBJECT 
+                                                #current_hri_state = STATE_GRAB_OBJECT_YOLO 
+                                                current_hri_state = STATE_GRAB_OBJECT
+                                                
                                                 hri_start_time = 0.0
                                             
                                             else:
@@ -2106,6 +2117,153 @@ def main():
                             print("\n🎉 [HRI] Grab success! Passing the object to user")
                             current_hri_state = STATE_LOOKING_FOR_USER
                             hri_start_time = 0.0
+                
+                # -----------------------------------
+                # 状态 5：基于 YOLO 闭环视觉伺服的动态盲抓
+                # -----------------------------------
+                elif current_hri_state == STATE_GRAB_OBJECT_YOLO:
+
+                    if hri_start_time == 0.0:
+                        print("\n" + "="*50)
+                        print("🦾 [HRI] State 5 (YOLO Vision Grasp): Switching to Absolute 3D Servoing!")
+                        
+                        # 1. 计算悬停安全点 (高度固定为桌面上方 30cm)
+                        safe_hover_z = getattr(scene_mapper, 'table_z', 0.0) + 0.30 
+                        
+                        # 👇 填入你提供的夹爪垂直向下四元数
+                        DOWNWARD_QUAT = [0.91, -0.42, 0.04, -0.02] 
+                        
+                        if fixation_point is None:
+                            print("🚨 丢失目标方位，退回状态 4...")
+                            current_hri_state = STATE_GAZE_INTERSECTION
+                            continue
+                            
+                        # 合成前往物体正上方的粗略坐标
+                        scene_mapper.yolo_hover_pose = [fixation_point[0], fixation_point[1], safe_hover_z] + DOWNWARD_QUAT
+                        
+                        # 飞往正上方安全点
+                        if robot is not None:
+                            robot.move_to(scene_mapper.yolo_hover_pose, speed=0.08)
+                            
+                        scene_mapper.yolo_step = 1
+                        hri_start_time = time.time()
+
+                    else:
+                        is_robot_idle = robot.path_queue.empty() if robot is not None else True
+                        
+                        # -----------------------------------------------------
+                        # 阶段 1：等待到达上方观测点，启动 3D 平滑伺服
+                        # -----------------------------------------------------
+                        if getattr(scene_mapper, 'yolo_step', 0) == 1:
+                            if is_robot_idle and (time.time() - hri_start_time > 1.0):
+                                print("👀 [YOLO Grasp] Arrived at overhead safety point. Activating 3D Servoing...")
+                                if robot is not None:
+                                    robot.start_servoing() # 启动 3D 绝对伺服
+                                scene_mapper.yolo_step = 2
+                                hri_start_time = time.time()
+                                
+                        # -----------------------------------------------------
+                        # 阶段 2：调用封装好的 YOLO 进行视觉对中与下探
+                        # -----------------------------------------------------
+                        elif getattr(scene_mapper, 'yolo_step', 0) == 2:
+                            
+                            # 🎯 1. 调用外部函数获取 YOLO 识别结果
+                            detections = yolo_detector.detect(global_color_image) # 传入当前彩色帧
+                            
+                            bbox_center_x, bbox_center_y = None, None 
+                            target_depth = None
+                            
+                            if len(detections) > 0:
+                                best_target = detections[0]
+                                bbox_center_x = best_target['x']
+                                bbox_center_y = best_target['y']
+                                target_angle_rad = best_target['angle'] # 🌟 拿到 2D 旋转角
+                                
+                                # 🌟 从 RealSense 硬件深度帧直接极速获取距离 (极其精准)
+                                # 假设你在外面提取到了 depth_frame_1
+                                if depth_frame_1 is not None:
+                                    target_depth = depth_frame_1.get_distance(bbox_center_x, bbox_center_y)
+                            
+                            # 获取机械臂当前坐标
+                            ee_pos, ee_quat = robot_listener.get_current_pose()
+                            
+                            if bbox_center_x is not None and bbox_center_y is not None and ee_pos is not None:
+                                
+                                # 2. 计算像素误差
+                                cx, cy = 320, 240 # 请修改为你画面的真实中心点(如 w/2, h/2)
+                                err_x_px = bbox_center_x - cx
+                                err_y_px = bbox_center_y - cy
+                                
+                                # 3. 像素到物理位移的映射系数 (调参关键！)
+                                M_PER_PIXEL = 0.0002 
+                                
+                                # 计算物理增量
+                                delta_x = err_y_px * M_PER_PIXEL  
+                                delta_y = err_x_px * M_PER_PIXEL  
+                                delta_z = 0.0
+                                
+                                # 4. XY 对准后开始下探 (误差在 15 像素以内)
+                                if abs(err_x_px) < 15 and abs(err_y_px) < 15:
+                                    delta_z = -0.01  # 每次往下降 1cm
+                                    
+                                # 5. 合成绝对坐标目标点并发送给伺服
+                                target_x = ee_pos[0] + delta_x
+                                target_y = ee_pos[1] + delta_y
+                                target_z = ee_pos[2] + delta_z
+                                
+                                from scipy.spatial.transform import Rotation as Rot
+                                
+                                # 1. 你原始的固定向下姿态
+                                base_rot = Rot.from_quat([0.91, -0.42, 0.04, -0.02])
+                                
+                                # 2. 根据 YOLO 角度生成绕 Z 轴的自转矩阵
+                                # 注意：这里的正负号可能需要根据你相机的物理安装方向做反转 (-target_angle_rad)
+                                z_rotation = Rot.from_euler('z', target_angle_rad, degrees=False)
+                                
+                                # 3. 叠加旋转 (右乘，相当于在夹爪局部坐标系下自转)
+                                final_rot = base_rot * z_rotation
+                                final_quat = final_rot.as_quat().tolist()
+
+                                # 4. 更新伺服目标 (如果你的 update_servo_target 支持传 7 维 Pose)
+                                # 🚨 注意：你需要把底层的 update_servo_target 升级一下，让它不仅接收 XYZ，还能接收 四元数
+                                target_pose_7d = [target_x, target_y, target_z] + final_quat
+
+                                if robot is not None:
+                                    robot.update_servo_target(target_pose_7d)
+                                    
+                                # 6. 触底检测：距离小于 12cm 时刹车！
+                                if target_depth is not None and target_depth > 0.0 and target_depth < 0.12:
+                                    print(f"⬇️ [YOLO Grasp] Depth trigger hit ({target_depth:.3f}m)! Stopping servoing...")
+                                    if robot is not None:
+                                        robot.stop_servoing()
+                                        
+                                    scene_mapper.yolo_step = 3
+                                    hri_start_time = time.time()
+                            else:
+                                # 画面中丢失目标，悬停在原地
+                                if robot is not None and ee_pos is not None:
+                                    robot.update_servo_target(ee_pos)
+                                    
+                        # -----------------------------------------------------
+                        # 阶段 3：闭合夹爪与提拉
+                        # -----------------------------------------------------
+                        elif getattr(scene_mapper, 'yolo_step', 0) == 3:
+                            # 留 0.5 秒让机械臂把残余伺服动作停稳
+                            if time.time() - hri_start_time > 0.5:
+                                print("✊ [YOLO Grasp] Object reached! Closing gripper...")
+                                if robot is not None:
+                                    robot.close_gripper(force=15.0, speed=0.05)
+                                    
+                                    # 提拉动作
+                                    curr_p, curr_r = robot_listener.get_current_pose()
+                                    if curr_p is not None:
+                                        lift_pose = [curr_p[0], curr_p[1], curr_p[2] + 0.20] + curr_r.tolist()
+                                        robot.move_to(lift_pose, speed=0.08)
+                                
+                                print("🎉 [YOLO Grasp] Blind grasp complete! Moving to delivery state...")
+                                current_hri_state = STATE_LOOKING_FOR_USER
+                                hri_start_time = 0.0
+                                scene_mapper.yolo_step = 0
                 # # -----------------------------------
                 # # 状态 6：寻找用户 -> 确认伸手 -> 翻转为递送姿势
                 # # -----------------------------------

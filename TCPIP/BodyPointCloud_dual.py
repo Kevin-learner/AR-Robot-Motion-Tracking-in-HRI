@@ -97,12 +97,18 @@ config_1.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 config_1.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
 pipeline_1.start(config_1)
 profile_1 = pipeline_1.get_active_profile()
-depth_profile_1 = rs.video_stream_profile(profile_1.get_stream(rs.stream.depth))
-depth_intrinsics_1 = depth_profile_1.get_intrinsics()
-w_1, h_1 = depth_intrinsics_1.width, depth_intrinsics_1.height
+# depth_profile_1 = rs.video_stream_profile(profile_1.get_stream(rs.stream.depth))
+# depth_intrinsics_1 = depth_profile_1.get_intrinsics()
+# w_1, h_1 = depth_intrinsics_1.width, depth_intrinsics_1.height
+# pc_1 = rs.pointcloud()
+# colorizer_1 = rs.colorizer()
+# K_1 = get_k_matrix(depth_intrinsics_1)
+color_profile_1 = rs.video_stream_profile(profile_1.get_stream(rs.stream.color))
+color_intrinsics_1 = color_profile_1.get_intrinsics()
+
+w_1, h_1 = color_intrinsics_1.width, color_intrinsics_1.height
 pc_1 = rs.pointcloud()
 colorizer_1 = rs.colorizer()
-K_1 = get_k_matrix(depth_intrinsics_1)
 
 # --------- Pipeline 2 Configuration---------
 if use_dual_camera:
@@ -495,13 +501,10 @@ def process_skeleton_single(pipeline, pc, color_intrinsics_out, R=None, T=None, 
     
     # === 🌟 紧接着在下面加上这几行：导出真实颜色！ ===
     global global_latest_colors
-    
     # 1. 把 RealSense 的 BGR 图像转为标准的 RGB 图像
     color_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-    
     # 2. 将图片展平并归一化到 0~1 之间 (Open3D 要求的颜色格式)
     flat_colors = color_rgb.reshape(-1, 3) / 255.0
-    
     # 3. 使用同样的 valid_mask，保证颜色和 3D 点一一对应
     global_latest_colors = flat_colors[valid_mask]
     
