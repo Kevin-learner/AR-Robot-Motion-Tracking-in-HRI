@@ -109,6 +109,7 @@ color_intrinsics_1 = color_profile_1.get_intrinsics()
 w_1, h_1 = color_intrinsics_1.width, color_intrinsics_1.height
 pc_1 = rs.pointcloud()
 colorizer_1 = rs.colorizer()
+K_1 = get_k_matrix(color_intrinsics_1)
 
 # --------- Pipeline 2 Configuration---------
 if use_dual_camera:
@@ -507,7 +508,13 @@ def process_skeleton_single(pipeline, pc, color_intrinsics_out, R=None, T=None, 
     flat_colors = color_rgb.reshape(-1, 3) / 255.0
     # 3. 使用同样的 valid_mask，保证颜色和 3D 点一一对应
     global_latest_colors = flat_colors[valid_mask]
+
+    global global_raw_color_image
+    global_raw_color_image = color_image.copy()
     
+    global global_depth_frame
+    global_depth_frame = depth_frame
+
     start_time = time.time()  # 开始计时
     #pose_2d_yolo = YOLOposeDetect(color_image)
     pose_2d_yolo = YOLOposeDetect_with_rotation(color_image, roll_angle=roll_angle)
@@ -599,7 +606,7 @@ def Body3DSkeletonProcess_dual(T_M, use_dual_camera=False, roll_angle=0.0):
 
        # pose_2d_1, pose_3d_1, verts_1, texcoords_1, colors_1, color_image_1, depth_intrinsics_1, mapped_frame_1, points_1 = result
         pose_2d_1, pose_3d_1, verts_1, texcoords_1, colors_1, color_image_1, depth_intrinsics_1, mapped_frame_1, depth_frame_1, points_1 = result
-
+        
         pose_3d_raw_1 = pose_3d_1.copy()
         pose_3d_1[:, 2] *= -1
         pose_3d_transformed_1 = transform_points(pose_3d_1, T_M)

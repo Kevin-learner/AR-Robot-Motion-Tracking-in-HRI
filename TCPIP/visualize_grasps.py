@@ -132,4 +132,4 @@ if __name__ == "__main__":
             target_idx = 0
 
         # 执行可视化
-        visualize_scene(pcd_file, grasps_file, top_n=15, gripper_scale=1.5, highlight_idx=target_idx)
+        visualize_scene(pcd_file, grasps_file, top_n=50, gripper_scale=1.5, highlight_idx=target_idx)

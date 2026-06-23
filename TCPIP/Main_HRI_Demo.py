@@ -12,6 +12,7 @@ import open3d as o3d
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import select
+import traceback
 
 # netsh interface portproxy add v4tov4 listenaddress=192.168.137.1 listenport=[本地监听端口] connectaddress=[机械臂的Tailscale IP] connectport=[机械臂服务端口]
 
@@ -577,8 +578,8 @@ def main():
     rviz_broadcaster = RvisSkeletonBroacaster.RVizSkeletonBroadcaster(frame_id="panda_link0")
 
   # 初始化 YOLO 检测器
-    yolo_detector = YoloGraspDetector(weights_path="checkpoints/yolo_weights.pt", conf=0.30)
-
+    yolo_detector = YoloGraspDetector(weights_filename="yolo_weights.pt", conf=0.30)
+    
     sSock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sSock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -1514,6 +1515,11 @@ def main():
                                             verts_robot_base = camera2unity.point_cloud_camera_to_robot(
                                                 p_crop, ee_pos, ee_quat, EE_T_C
                                             )
+
+                                            # Manual Offset
+                                            verts_robot_base[:,2]-=0.06
+
+
                                             scene_mapper.add_point_cloud(verts_robot_base, c_crop)
                                             print(f"   ✅ [State 3 (Scanning Objects)] Node {scan_current_step + 1}拼合成功。")
                                         else:
@@ -1550,7 +1556,7 @@ def main():
                                     final_pcd = final_pcd.select_by_index(valid_z_indices)
 
                                     print("   🧹 State 3 (Scanning Objects): 1. Performing statistical filtering for noise reduction...")
-                                    cleaned_pcd, _ = final_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+                                    cleaned_pcd, _ = final_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=3.0)
                                     
                                     scene_mapper.global_pcd = cleaned_pcd
                                     scene_mapper.display_pcd.points = cleaned_pcd.points
@@ -1911,7 +1917,7 @@ def main():
                                                     
                                                     # 注入 7 厘米深插下探
                                                     local_advance = np.eye(4)
-                                                    local_advance[2, 3] = 0.070 
+                                                    local_advance[2, 3] = 0.030 
                                                     tuned_grasp = tuned_grasp @ local_advance
                                                     
                                                     # 180° 抄近道对称性优化
@@ -2035,7 +2041,7 @@ def main():
                         elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 3.0 and is_robot_idle:
                             print("   -> ✊ Step 3: Contacting the target, closing the gripper...")
                             if robot is not None:
-                                robot.close_gripper(force=15.0, speed=0.05) 
+                                robot.close_gripper(force=20.0, speed=0.05) 
                             
                             scene_mapper.grasp_step = 3
                             hri_start_time = time.time()
@@ -2168,7 +2174,8 @@ def main():
                         elif getattr(scene_mapper, 'yolo_step', 0) == 2:
                             
                             # 🎯 1. 调用外部函数获取 YOLO 识别结果
-                            detections = yolo_detector.detect(global_color_image) # 传入当前彩色帧
+                            current_color_image = BodyPointCloud_dual.global_raw_color_image 
+                            detections = yolo_detector.detect(current_color_image) # 传入当前彩色帧
                             
                             bbox_center_x, bbox_center_y = None, None 
                             target_depth = None
@@ -2181,9 +2188,10 @@ def main():
                                 
                                 # 🌟 从 RealSense 硬件深度帧直接极速获取距离 (极其精准)
                                 # 假设你在外面提取到了 depth_frame_1
-                                if depth_frame_1 is not None:
-                                    target_depth = depth_frame_1.get_distance(bbox_center_x, bbox_center_y)
-                            
+                                if BodyPointCloud_dual.global_depth_frame is not None:
+                                    target_depth = BodyPointCloud_dual.global_depth_frame.get_distance(bbox_center_x, bbox_center_y)
+                                else:
+                                    print("depthframe not found")
                             # 获取机械臂当前坐标
                             ee_pos, ee_quat = robot_listener.get_current_pose()
                             
@@ -2571,6 +2579,7 @@ def main():
 
     except Exception as e:
         print(f"[TCP] Server Error: {e}")
+        traceback.print_exc()  # 🌟 加这一行！它会打印出到底是哪个文件的哪一行触发了 resize 报错
 
     finally:
         try:
