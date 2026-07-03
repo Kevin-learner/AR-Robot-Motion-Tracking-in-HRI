@@ -10,8 +10,8 @@ K = np.array([
 ], dtype=np.float64)
 D = np.zeros(5) # 你的畸变系数是全0
 
-CHESSBOARD_SIZE = (7, 5)
-SQUARE_SIZE = 0.025
+CHESSBOARD_SIZE = (7, 4)
+SQUARE_SIZE = 0.023  # 米 (25mm)
 
 def solve_calibration():
     # 1. 加载样本

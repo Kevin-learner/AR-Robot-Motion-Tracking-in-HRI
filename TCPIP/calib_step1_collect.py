@@ -7,8 +7,8 @@ from scipy.spatial.transform import Rotation as R
 import robotPositionListener  # 确保你的项目路径中有这个文件
 
 # --- 标定板配置 ---
-CHESSBOARD_SIZE = (7, 5)
-SQUARE_SIZE = 0.025  # 米 (25mm)
+CHESSBOARD_SIZE = (7, 4)
+SQUARE_SIZE = 0.023  # 米 (25mm)
 
 def main():
     # 1. 初始化机器人监听器
@@ -39,12 +39,18 @@ def main():
             
             show_img = img.copy()
             if ret:
+
+                
+                # 亚像素级角点优化
+                criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+                corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria) 
+
                 cv2.drawChessboardCorners(show_img, CHESSBOARD_SIZE, corners, ret)
             
             cv2.imshow("Calibration Samples Collector", show_img)
             key = cv2.waitKey(1)
 
-            if key == ord('r'): # 空格采集
+            if key == ord('r'): # r采集
                 if ret:
                     # 获取机器人实时位姿
                     ee_pos, ee_quat = listener.get_current_pose()
