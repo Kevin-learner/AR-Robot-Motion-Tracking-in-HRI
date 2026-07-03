@@ -90,6 +90,29 @@ EE_T_C = np.array(config['handeyecalibration']['EE_T_C']) # 从配置加载 EE_T
 
 executor = ThreadPoolExecutor(max_workers=1)
 
+OFFSET_CONFIG_FILE = "pointcloud_offset.yaml"
+
+def load_z_offset():
+    """读取本地存储的 Z 轴偏置量，默认 -0.06"""
+    try:
+        if os.path.exists(OFFSET_CONFIG_FILE):
+            with open(OFFSET_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+                if data and 'z_offset' in data:
+                    return float(data['z_offset'])
+    except Exception as e:
+        print(f"⚠️ Load Z offset failed: {e}, using default -0.06")
+    return -0.06  # 默认值
+
+def save_z_offset(offset):
+    """保存 Z 轴偏置量到本地"""
+    try:
+        with open(OFFSET_CONFIG_FILE, 'w', encoding='utf-8') as f:
+            yaml.dump({'z_offset': float(offset)}, f)
+    except Exception as e:
+        print(f"❌ Save Z offset failed: {e}")
+# =========================================================
+
 # import calibration module
 try:
     from compute_alignment import align_with_realsense
@@ -605,6 +628,11 @@ def main():
     else:
         print(" [System] No calibration cache found. Calibration required.")
 
+    # 初始化读取Z轴偏置 与 阀门状态
+    global_z_offset = load_z_offset()
+    is_offset_edit_mode = False  # 阀门状态：False表示全自动放行，True表示扫描后暂停等待修改
+    print(f"🔧 [Config] 初始点云 Z 轴偏置量已加载: {global_z_offset:.4f} 米")
+
     # ===  HRI 状态机初始化 ===
     is_HRI_Demo = False  # 是否进入 Demo 模式的总开关
     STATE_IDLE = -1          # 待机状态
@@ -724,7 +752,7 @@ def main():
                     print(f"[TCP] Connection Error: {e}")
                     break
                 
-                if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f', 'e', 'h', 'O', 'P']:
+                if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f', 'e', 'h', 'O', 'P', 'Z', 'U', 'V']:
                     #print(f"\n[TCP] Received Header: '{header}'")
                     conn.setblocking(True)
                 # ===============================================
@@ -1163,6 +1191,39 @@ def main():
                     elif header == 'P': 
                         is_HRI_Demo = False
                         print("Demo Mode Deactivated")
+
+                    # ===============================================
+                    # 🌟 阀门与偏置控制：'U'(开阀门编辑), 'V'(关阀门放行), 'Z'(微调高度)
+                    # ===============================================
+                    elif header == 'U':
+                        is_offset_edit_mode = True
+                        print("\n🔒 [Valve] Offset Edit Mode Activated")
+                        
+                    elif header == 'V':
+                        is_offset_edit_mode = False
+                        scene_mapper.valve_open = True  # 立即放行当前的阻塞
+                        print("\n🔓 [Valve] Offset Edit Mode Deactivated (Auto Release)！")
+                        
+                    elif header == 'Z':
+                        # 接收 4 字节的 float (小端序)，代表要增减的数值 delta (如 +0.01 或 -0.01)
+                        delta_bytes = recv_exact(conn, 4)
+                        if delta_bytes:
+                            delta_z = struct.unpack('<f', delta_bytes)[0]
+                            global_z_offset += delta_z
+                            save_z_offset(global_z_offset) # 立即持久化
+                            
+                            print(f"\n📐 [Offset] Offset adjusted by {delta_z*100:.2f} cm. Current total offset: {global_z_offset:.4f} m")
+                            
+                            # === 核心：对内存中已经建好的地图进行实时位移，并刷新 HoloLens ===
+                            if hasattr(scene_mapper, 'global_pcd') and scene_mapper.global_pcd is not None and not scene_mapper.global_pcd.is_empty():
+                                shift_vec = np.array([0.0, 0.0, delta_z])
+                                scene_mapper.global_pcd.translate(shift_vec)
+                                if hasattr(scene_mapper, 'display_pcd'):
+                                    scene_mapper.display_pcd.translate(shift_vec)
+                                if hasattr(scene_mapper, 'objects_pcd') and scene_mapper.objects_pcd is not None and not scene_mapper.objects_pcd.is_empty():
+                                    scene_mapper.objects_pcd.translate(shift_vec)
+                                    
+                                scene_mapper.update_window()
                 elif header == 'S': 
                     sender.is_streaming = True
                     print("▶️ Video Streaming Started")
@@ -1183,6 +1244,8 @@ def main():
                 elif header == 'H': 
                     is_robot_state_streaming = False
                     print("⏹️ Stopped streaming 【Full Joint Real-time Poses】")
+
+                
 
                 # ===============   ================================
                 # CASE 'x': 退出 (Exit)
@@ -1517,13 +1580,13 @@ def main():
                                             )
 
                                             # Manual Offset
-                                            verts_robot_base[:,2]-=0.06
+                                            # verts_robot_base[:,2]-=0.06
 
 
                                             scene_mapper.add_point_cloud(verts_robot_base, c_crop)
-                                            print(f"   ✅ [State 3 (Scanning Objects)] Node {scan_current_step + 1}拼合成功。")
+                                            print(f"   ✅ [State 3 (Scanning Objects)] Node {scan_current_step + 1}successfully captured and added to the global point cloud. Total points: {len(scene_mapper.global_pcd.points)}")
                                         else:
-                                            print(f"   ⚠️ [State 3 (Scanning Objects)] Node {scan_current_step + 1} 数据流丢帧，跳过该帧。")
+                                            print(f"   ⚠️ [State 3 (Scanning Objects)] Node {scan_current_step + 1} skipped: No point cloud data received from the camera!")
                                             
                                         # 迈向下一步
                                         scan_current_step += 1
@@ -1557,6 +1620,9 @@ def main():
 
                                     print("   🧹 State 3 (Scanning Objects): 1. Performing statistical filtering for noise reduction...")
                                     cleaned_pcd, _ = final_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=3.0)
+
+                                    print(f"   📐 State 3: Applying initial global Z offset: {global_z_offset:.4f} m")
+                                    cleaned_pcd.translate(np.array([0.0, 0.0, global_z_offset]))
                                     
                                     scene_mapper.global_pcd = cleaned_pcd
                                     scene_mapper.display_pcd.points = cleaned_pcd.points
@@ -1600,8 +1666,9 @@ def main():
                                         future = executor.submit(ai_task, real_points_camera, real_colors, K_1, "100.116.99.44")
                                         scene_mapper.current_robot_t_c = ROBOT_T_C # 暂存这个矩阵
                                         scene_mapper.ai_future = future
-                                        scene_mapper.scan_post_process = 2
-                                    
+                                        has_ai_request = True
+                                        print("   🧠 [State 3 (Scanning Objects)] Asynchronous AI inference initiated.")    
+
                                     # 🌟 标记：第一次完整的物理扫描已经完成了！以后都不用再扫了
                                     has_completed_initial_scan = True 
 
@@ -1638,36 +1705,73 @@ def main():
                                     print(f"   🤖 State 3 (Scanning Objects): Moving to safe observation/delivery position...")
                                     if robot is not None:
                                         robot.move_to(READY_FOR_PASSING_POSE, speed=0.05)
-                                        
-                                    if getattr(scene_mapper, 'scan_post_process', 0) != 2:
-                                        scene_mapper.scan_post_process = 1
-                                    hri_start_time = time.time()
                                     
+                                    if is_offset_edit_mode:
+                                        print("\n   ⏳ [Valve Closed] 偏置编辑模式已开启！正在挂起，等待 HoloLens 'Z' 调整或 'V' 放行...")
+                                        scene_mapper.valve_open = False
+                                    else:
+                                        print("\n   ⏩ [Valve Open] 自动模式！直接加载默认偏置，放行进入 AI 计算...")
+                                        scene_mapper.valve_open = True
+                                        
+                                    scene_mapper.scan_post_process = 0.5
+                                    hri_start_time = time.time()
+
+
+                                elif getattr(scene_mapper, 'scan_post_process', 0) == 0.5:
+                                    # 如果阀门开了 (自动模式 或 刚刚收到 'V' 指令)
+                                    if getattr(scene_mapper, 'valve_open', False):
+                                        print("\n   🧠 [AI Pipeline] 提取当前【已偏置点云】并送入神经网络运算...")
+
+                                        if request_grasps_from_graspnet is not None and not has_completed_initial_scan:
+                                            ee_pos, ee_quat = robot_listener.get_current_pose()
+                                            ROBOT_T_C = camera2unity.get_camera_to_robot_matrix(ee_pos, ee_quat, EE_T_C)
+                                            C_T_ROBOT = np.linalg.inv(ROBOT_T_C)
+
+                                            # 这里提取的全局点云，可能已经在上一步被全局偏移过，也可能被 'Z' 调整过
+                                            real_points_base = np.asarray(scene_mapper.global_pcd.points)
+                                            ones = np.ones((real_points_base.shape[0], 1))
+                                            points_hom = np.hstack((real_points_base, ones))
+                                            
+                                            # 逆变换回相机坐标系
+                                            real_points_camera = (C_T_ROBOT @ points_hom.T).T[:, :3] 
+                                            real_colors = np.asarray(scene_mapper.global_pcd.colors) if scene_mapper.global_pcd.has_colors() else np.zeros_like(real_points_base)
+
+                                            def ai_task(points, colors, K, ip):
+                                                return request_grasps_from_graspnet(points, colors, K, server_ip=ip)
+
+                                            future = executor.submit(ai_task, real_points_camera, real_colors, K_1, "100.116.99.44")
+                                            scene_mapper.current_robot_t_c = ROBOT_T_C 
+                                            scene_mapper.ai_future = future
+                                            
+                                            has_completed_initial_scan = True
 
                                 
                                 elif getattr(scene_mapper, 'scan_post_process', 0) == 2:
-                                    if scene_mapper.ai_future.done():
-                                        # 🌟 AI 在相机系下预测出来的原始结果
-                                        ai_grasps_camera = scene_mapper.ai_future.result() 
-                                        
-                                        if ai_grasps_camera is not None:
-                                            print(f"🧠 State 3 (Scanning Objects): AI in camera frame predicted {ai_grasps_camera.shape[0]} poses, transforming to robot base frame...")
+                                    if has_ai_request and scene_mapper.ai_future is not None:
+                                        if scene_mapper.ai_future.done():
+                                            # 🌟 AI 在相机系下预测出来的原始结果
+                                            ai_grasps_camera = scene_mapper.ai_future.result() 
                                             
-                                            # 拿出刚才状态 3 存下来的那一瞬间的 ROBOT_T_C
-                                            ROBOT_T_C = scene_mapper.current_robot_t_c
-                                            ai_grasps_base = np.zeros_like(ai_grasps_camera)
-                                            
-                                            # 🌟 矩阵左乘变换：将相机系抓取转为机器人基座系
-                                            for i in range(ai_grasps_camera.shape[0]):
-                                                ai_grasps_base[i] = ROBOT_T_C @ ai_grasps_camera[i]
+                                            if ai_grasps_camera is not None:
+                                                print(f"🧠 State 3 (Scanning Objects): AI in camera frame predicted {ai_grasps_camera.shape[0]} poses, transforming to robot base frame...")
                                                 
-                                            scene_mapper.ai_grasps = ai_grasps_base
+                                                # 拿出刚才状态 3 存下来的那一瞬间的 ROBOT_T_C
+                                                ROBOT_T_C = scene_mapper.current_robot_t_c
+                                                ai_grasps_base = np.zeros_like(ai_grasps_camera)
+                                                
+                                                # 🌟 矩阵左乘变换：将相机系抓取转为机器人基座系
+                                                for i in range(ai_grasps_camera.shape[0]):
+                                                    ai_grasps_base[i] = ROBOT_T_C @ ai_grasps_camera[i]
+                                                    
+                                                scene_mapper.ai_grasps = ai_grasps_base
+                                                
+                                                # 自动保存到本地文件
+                                                np.save("test_output_grasps.npy", ai_grasps_base)
+                                                print("🎉 [State 3 (Scanning Objects)] Asynchronous inference and coordinate alignment completed successfully! File saved.")
+
+                                                has_ai_request = False
                                             
-                                            # 自动保存到本地文件
-                                            np.save("test_output_grasps.npy", ai_grasps_base)
-                                            print("🎉 [State 3 (Scanning Objects)] Asynchronous inference and coordinate alignment completed successfully! File saved.")
-                                            
-                                        scene_mapper.scan_post_process = 1
+                                    scene_mapper.scan_post_process = 1
                                         
                                 elif getattr(scene_mapper, 'scan_post_process', 0) == 1:
                                     if is_robot_idle and (time.time() - hri_start_time > 1.0):
