@@ -1683,14 +1683,14 @@ def main():
                                         print("\n   ⏩ [Valve Open] 自动模式！直接加载默认偏置，放行进入 AI 计算...")
                                         scene_mapper.valve_open = True
                                         
-                                    scene_mapper.scan_post_process = 0.5
+                                    scene_mapper.scan_post_process = 3
                                     hri_start_time = time.time()
 
 
                                 # ---------------------------------------------------------
                                 # 🌟 阶段 0.5：等待阀门开启，开启后提取当前内存点云计算抓取位姿
                                 # ---------------------------------------------------------
-                                elif getattr(scene_mapper, 'scan_post_process', 0) == 0.5:
+                                elif getattr(scene_mapper, 'scan_post_process', 0) == 3:
                                     if getattr(scene_mapper, 'valve_open', False):
                                         print("\n   🧠 [AI Pipeline] 提取当前【已偏置点云】并送入神经网络运算...")
 
@@ -1772,8 +1772,8 @@ def main():
                         
                         fixation_point = None       
                         fixation_start_time = 0.0   
-                        FIXATION_TOLERANCE = 0.05   
-                        FIXATION_TIME_REQUIRED = 2.0 
+                        FIXATION_TOLERANCE = 0.08   
+                        FIXATION_TIME_REQUIRED = 1.5 
                         
                     else:
                         scene_mapper.update_window() 
@@ -2450,9 +2450,9 @@ def main():
                                 if dist_to_base < WORKSPACE_RADIUS:
                                     print(f"🎯 [HRI] Detected hand entering workspace (Distance: {dist_to_base:.2f}m)! Initiating gripper flip to downward delivery pose...")
                                     
-                                    # 🌟 触发移动到夹爪向下的准备姿态
-                                    if robot is not None:
-                                        robot.move_to(READY_FOR_PASSING_POSE, speed=0.08)
+                                    # # 🌟 触发移动到夹爪向下的准备姿态
+                                    # if robot is not None:
+                                    #     robot.move_to(READY_FOR_PASSING_POSE, speed=0.08)
                                     
                                     scene_mapper.looking_step = 2 # 切换到阶段 2
                                     hri_start_time = time.time()  # 重置计时器
@@ -2479,8 +2479,17 @@ def main():
                 elif current_hri_state == STATE_TRACKING_AND_PASS:
                     # 刚进入状态，初始化
                     if hri_start_time == 0.0:
+
+                        
                         if robot is not None:
                             robot.start_servoing()
+                            
+                            # 🌟 新增：在开启伺服的瞬间，记录当前的空载(带物品)基准力
+                            try:
+                                scene_mapper.tracking_baseline_fz = robot.get_wrench()[2]
+                            except:
+                                scene_mapper.tracking_baseline_fz = 0.0
+
                         hri_start_time = time.time()
                         handover_dwell_start = 0.0
                         scene_mapper.pass_step = 0  
@@ -2490,6 +2499,48 @@ def main():
                     # 阶段 0：3D 伺服追踪，直到在手掌上方稳定停留
                     # =========================================================
                     if getattr(scene_mapper, 'pass_step', 0) == 0:
+
+                        # 🌟🌟🌟 在伺服追踪过程中，高频检测是否有用户“提前拿取/拉拽”
+                        early_grab_triggered = False
+                        if robot is not None and hasattr(scene_mapper, 'tracking_baseline_fz'):
+                            try:
+                                current_fz = robot.get_wrench()[2]
+                                delta_fz = abs(current_fz - scene_mapper.tracking_baseline_fz)
+                                
+                                # 因为伺服运动伴随加减速惯性，阈值需稍大于匀速阶段 (比如 5.0N - 6.0N)
+                                EARLY_FORCE_THRESHOLD = 5.5 
+                                if delta_fz > EARLY_FORCE_THRESHOLD:
+                                    print(f"\n⚡ [HRI] Early interaction detected! (ΔFz={delta_fz:.2f}N). User is pulling the object!")
+                                    early_grab_triggered = True
+                            except Exception:
+                                pass
+                                
+                        # 🌟🌟🌟 如果用户提前抢夺，立刻执行“紧急松手”逻辑，并跳出当前帧
+                        if early_grab_triggered:
+                            if robot is not None:
+                                robot.stop_servoing()          # 立刻刹车
+                                robot.path_queue.queue.clear() # 清除后续路径
+                                
+                            print("🤝 [HRI] Successfully transferred (Early Release), opening gripper!")
+                            time.sleep(0.2) 
+                            
+                            if robot is not None:
+                                robot.open_gripper(width=0.08) 
+                            
+                            if T_M is not None:
+                                send_path_to_hololens(conn, [], T_M)
+                                
+                            # 状态机重置，切回扫描状态
+                            current_hri_state = STATE_SCAN_OBJECTS
+                            hri_start_time = 0.0
+                            handover_dwell_start = 0.0
+                            global_holo_hand_pos = None
+                            scene_mapper.pass_step = 0
+                            if hasattr(scene_mapper, 'tracking_baseline_fz'): 
+                                del scene_mapper.tracking_baseline_fz
+                                
+                            continue # 提前结束本帧循环，不再往下执行伺服运动指令！
+
                         if global_holo_hand_pos is not None:
                             
                             # 🌟 新增：工作空间边界安全保护 (安全电子围栏)
