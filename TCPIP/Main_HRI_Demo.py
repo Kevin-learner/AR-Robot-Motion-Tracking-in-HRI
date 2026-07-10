@@ -668,6 +668,9 @@ def main():
     # 存放最新的全局坐标系下的眼动射线
     global_ray_origin = None 
     global_ray_hit = None
+    
+    instant_select_flag = False
+
     current_point_cloud = None
 
     global_holo_hand_pos = None
@@ -752,7 +755,7 @@ def main():
                     print(f"[TCP] Connection Error: {e}")
                     break
                 
-                if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f', 'e', 'h', 'O', 'P', 'Z', 'U', 'V']:
+                if header in ['d', 'r', 'b', 'm', 'p', 'v', 'f', 'e', 'R', 'h', 'O', 'P', 'Z', 'U', 'V']:
                     #print(f"\n[TCP] Received Header: '{header}'")
                     conn.setblocking(True)
                 # ===============================================
@@ -1169,6 +1172,33 @@ def main():
                             #print(f"👁️ [TCP] 眼动坐标已更新...")
                         else:
                             print("   ⚠️ T_M is None. Cannot transform gaze coordinates. Please calibrate first.")
+
+                    # ===============================================
+                    # CASE 'R': 接收原生手部射线坐标 (Hand Ray Pinch)
+                    # ===============================================
+                    elif header == 'R':
+                        ray_data_bytes = recv_exact(conn, 24)
+                        if not ray_data_bytes: break
+                        
+                        ray_data = struct.unpack('<6f', ray_data_bytes)
+                        u_origin_pos = np.array(ray_data[0:3])
+                        u_hit_pos = np.array(ray_data[3:6])
+                        
+                        if T_M is not None:
+                            # 坐标转换
+                            r_origin_pos = rut.unity2robot_transform(u_origin_pos, T_M)
+                            r_hit_pos = rut.unity2robot_transform(u_hit_pos, T_M)
+                            
+                            # 🌟 覆盖给通用的射线全局变量 (和眼动共用一套碰撞逻辑)
+                            global_ray_origin = r_origin_pos
+                            global_ray_hit = r_hit_pos
+                            
+                            # 🌟 核心：点燃“立刻选择”标记！
+                            instant_select_flag = True 
+                            
+                            print(f"🤏 [TCP] Pinch Click Detected! Hand Ray: {np.round(r_hit_pos, 3)}")
+                        else:
+                            print("   ⚠️ T_M is None. Cannot transform hand ray coordinates.")
 
                     # ===============================================
                     # 🌟 CASE 'h': 接收原生手掌跟踪坐标 (Header 'h')
@@ -1829,219 +1859,234 @@ def main():
                                 fixation_start_time = time.time()
                             else:
                                 dist = np.linalg.norm(current_pt - fixation_point)
+
+                                is_confirmed = False
+
+                                if instant_select_flag:
+                                    is_confirmed = True
+                                    fixation_point = current_pt  # 使用捏合瞬间最精确的点
+                                    instant_select_flag = False  # 用完即焚，防止无限连发
+                                    print("\n⚡ [State 4] Pinch confirmation triggered! Bypassing dwell timer.")
+
                                 if dist < FIXATION_TOLERANCE:
                                     dwell_time = time.time() - fixation_start_time
                                     
                                     # 盯住 2 秒了！开始吸附盒子！
                                     if dwell_time >= FIXATION_TIME_REQUIRED:
-                                        
-                                        if hasattr(scene_mapper, 'objects_pcd') and not scene_mapper.objects_pcd.is_empty():
-                                            # 🧲 去【纯净盒子地图】里找离当前落点最近的点
-                                            kdtree = o3d.geometry.KDTreeFlann(scene_mapper.objects_pcd)
-                                            _, idx, sq_dist = kdtree.search_knn_vector_3d(fixation_point, 1)
-                                            
-                                            distance_to_box = np.sqrt(sq_dist[0])
-                                            
-                                            # 如果你看的地方方圆 20 厘米内根本没有盒子，说明你在看空桌子，放弃抓取
-                                            if distance_to_box > 0.3:
-                                                print(f"\n ⚠️ [State 4 (Gaze Intersection)]: No boxes found around gaze point, please look at a box! distance to box : {np.round(distance_to_box, 3)}")
-                                                fixation_point = None
-                                                fixation_start_time = time.time()
-                                                continue
-                                                
-                                            # 成功吸附！获取盒子 ID（因为噪点被删了，这里必定是有效盒子）
-                                            box_id = scene_mapper.object_labels[idx[0]]
-                                            
-                                            # =======================================================
-                                            # 🔍【全面诊断补丁】打印所有盒子中心、视线落点及吸附过程
-                                            # =======================================================
-                                            print("\n" + "🔍" * 20)
-                                            print(f"🎯 [State 4 (Gaze Intersection)]: Gaze point in world frame (robot base): {np.round(fixation_point, 3)}")
-                                            print(f"🧲 [State 4 (Gaze Intersection)]: Distance to nearest point from KDTree: {np.round(distance_to_box * 100, 1)} cm")
-                                            
-                                            # 遍历当前场景里所有被分割出来的不同盒子，算出它们各自的中心点
-                                            unique_labels = np.unique(scene_mapper.object_labels)
-                                            print(f"📦 [State 4 (Gaze Intersection)]: Currently detected {len(unique_labels)} objects in the memory map:")
-                                            
-                                            for label in unique_labels:
-                                                # 提取这个标签对应的所有点
-                                                lbl_indices = np.where(scene_mapper.object_labels == label)[0]
-                                                lbl_points = np.asarray(scene_mapper.objects_pcd.points)[lbl_indices]
-                                                
-                                                # 粗略算一下这个盒子的中心（这里用 mean 快速计算用于诊断）
-                                                lbl_center = np.mean(lbl_points, axis=0)
-                                                
-                                                # 计算你的眼睛落点到这个盒子中心的距离
-                                                dist_from_gaze = np.linalg.norm(fixation_point - lbl_center)
-                                                
-                                                # 如果这个标签刚好是被吸附的标签，加个醒目的五星标记
-                                                flag = "⭐ [State 4 (Gaze Intersection)]: Target Object" if label == box_id else "  "
-                                                print(f"   {flag} 物体ID {label} -> 几何中心: {np.round(lbl_center, 3)} | 离你视线落点距离: {np.round(dist_from_gaze * 100, 1)} cm")
-                                            print("🔍" * 20 + "\n")
-                                            # =======================================================
-
-                                            # 📦 提取这整个盒子的所有点，计算几何中心
-                                            box_indices = np.where(scene_mapper.object_labels == box_id)[0]
-                                            box_points = np.asarray(scene_mapper.objects_pcd.points)[box_indices]
-
-                                           # 1. 将 numpy 数组转为 Open3D 点云对象
-                                            single_box_pcd = o3d.geometry.PointCloud()
-                                            single_box_pcd.points = o3d.utility.Vector3dVector(box_points)
-
-                                            # 2. 计算有向包围盒 (OBB)
-                                            obb = single_box_pcd.get_oriented_bounding_box()
-
-                                            # # =======================================================
-                                            # # 🌟【修改 2】残影消除：把这个盒子从全局记忆地图中抹除！
-                                            # # =======================================================
-                                            # # 稍微放大一下 OBB (比如 1.2 倍)，确保边缘和底部的噪点也能被包裹进去
-                                            # eraser_obb = o3d.geometry.OrientedBoundingBox(obb)
-                                            # eraser_obb.scale(1.2, eraser_obb.center)
-                                            
-                                            # # 获取全局地图中，落在这个“橡皮擦盒子”里的所有点的索引
-                                            # ghost_indices = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.global_pcd.points)
-                                            
-                                            # # 使用 invert=True 进行反向提取，相当于把这些点“抠除”
-                                            # scene_mapper.global_pcd = scene_mapper.global_pcd.select_by_index(ghost_indices, invert=True)
-                                            
-                                            # # 同步把这个物体从“磁铁”点云中剔除，防止接下来发生重复吸附
-                                            # ghost_indices_obj = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.objects_pcd.points)
-                                            # scene_mapper.objects_pcd = scene_mapper.objects_pcd.select_by_index(ghost_indices_obj, invert=True)
-                                            
-                                            # print(f"🧹 [State 4 (Gaze Intersection)]: Successfully removed ghost points of box {box_id} from the global point cloud map!")
-                                            # # =======================================================
-
-                                            # 3. 获取真正的几何中心 (这比 np.mean 准得多！)
-                                            box_center = obb.center
-
-                                            # 4. 获取盒子的长宽高尺寸 (用于决定夹爪张开多大)
-                                            box_size = obb.extent 
-                                            print(f"📦 [State 4 (Gaze Intersection)]: Box dimensions: {np.round(box_size, 3)} meters")
-
-                                            # 5. 获取盒子的旋转矩阵 (用于对齐夹爪姿态！)
-                                            box_rotation = obb.R
-                                            
-                                            print(f"\n 🎉 [State 4 (Gaze Intersection)]: Target Box {box_id}")
-                                            print(f" 🎯 Box Geometry Center: {np.round(box_center, 3)}")
-                                            
-
-                                        #    
-                                        # =======================================================
-                                        # 🪐【重构筛选】多目标优选 —— 提取前3名顺位黄金抓取姿态
-                                        # =======================================================
-                                        if hasattr(scene_mapper, 'ai_grasps') and scene_mapper.ai_grasps is not None and len(scene_mapper.ai_grasps) > 0:
-                                            CANDIDATE_POOL_LIMIT = 200 
-                                            candidates_scored = [] # 新增：用于存放所有合法姿态的临时列表
-                                            
-                                            # 1. 第一轮过滤与双标大评分
-                                            for idx_g, grasp_matrix in enumerate(scene_mapper.ai_grasps[:CANDIDATE_POOL_LIMIT]):
-                                                grasp_xyz = grasp_matrix[:3, 3]
-                                                approach_vector = grasp_matrix[:3, 2] 
-                                                
-                                                # A. 计算探针距离
-                                                PROJECTION_DEPTH = 0.15 
-                                                projected_xyz = grasp_xyz + PROJECTION_DEPTH * approach_vector
-                                                dist_to_center = np.linalg.norm(projected_xyz - box_center)
-                                                if dist_to_center > 0.15: continue
-                                                    
-                                                # B. 计算倾斜垂直度
-                                                downward_vector = np.array([0.0, 0.0, -1.0])
-                                                tilt_alignment = np.dot(approach_vector, downward_vector)
-                                                tilt_alignment = np.clip(tilt_alignment, -1.0, 1.0)
-                                                if tilt_alignment < 0.64: continue
-                                                    
-                                                # C. 综合评分并塞入池中
-                                                distance_score = 1.0 - (dist_to_center / 0.15)
-                                                combined_score = 0.6 * distance_score + 0.4 * tilt_alignment
-                                                
-                                                candidates_scored.append((combined_score, grasp_matrix, dist_to_center, tilt_alignment, idx_g))
-
-                                            # 2. 第二轮：按照得分从高到低强行排序，并斩取前 3 名
-                                            candidates_scored.sort(key=lambda x: x[0], reverse=True)
-                                            top_3_candidates = candidates_scored[:3]
-                                            
-                                            if len(top_3_candidates) > 0:
-
-                                                eraser_obb = o3d.geometry.OrientedBoundingBox(obb)
-                                                eraser_obb.scale(1.2, eraser_obb.center)
-                                                
-                                                # 1. 删 Global Map
-                                                ghost_indices = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.global_pcd.points)
-                                                scene_mapper.global_pcd = scene_mapper.global_pcd.select_by_index(ghost_indices, invert=True)
-                                                
-                                                # 2. 删 Object Map
-                                                ghost_indices_obj = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.objects_pcd.points)
-                                                ghost_indices_np = np.asarray(ghost_indices_obj) # 必须转为 numpy
-                                                
-                                                # 3. 🌟 绝对同步删 Labels (必须在更新 objects_pcd 之前做！)
-                                                mask = np.ones(len(scene_mapper.object_labels), dtype=bool)
-                                                mask[ghost_indices_np] = False
-                                                scene_mapper.object_labels = scene_mapper.object_labels[mask]
-                                                
-                                                # 4. 最后更新 objects_pcd，保证 1:1 对齐
-                                                scene_mapper.objects_pcd = scene_mapper.objects_pcd.select_by_index(ghost_indices_obj, invert=True)
-
-                                                print(f"🧹 顺位筛选通过！已从记忆地图中抹除该物品的残影。")
-
-                                                scene_mapper.tuned_grasps_pool = [] # 🌟 新增：存放微调后的前3顺位矩阵池
-                                                
-                                                print(f"\n🎯 [多目标筛选] 针对当前目标成功锁定 {len(top_3_candidates)} 个顺位备份姿态:")
-                                                
-                                                # 3. 统一对前3名进行局部微调运算
-                                                for rank, (score, selected_grasp, saved_dist, saved_tilt, selected_idx) in enumerate(top_3_candidates):
-                                                    # 注入 45 度自转
-                                                    Rz_45 = np.array([
-                                                        [ 0.7071,  0.7071,  0.0,  0.0],
-                                                        [-0.7071,  0.7071,  0.0,  0.0],
-                                                        [ 0.0,     0.0,     1.0,  0.0],
-                                                        [ 0.0,     0.0,     0.0,  1.0]
-                                                    ])
-                                                    tuned_grasp = selected_grasp @ Rz_45
-                                                    
-                                                    # 注入 7 厘米深插下探
-                                                    local_advance = np.eye(4)
-                                                    local_advance[2, 3] = 0.0 
-                                                    tuned_grasp = tuned_grasp @ local_advance
-                                                    
-                                                    # 180° 抄近道对称性优化
-                                                    ee_pos_temp, ee_quat_temp = robot_listener.get_current_pose()
-                                                    from scipy.spatial.transform import Rotation as Rot
-                                                    R_curr = Rot.from_quat(ee_quat_temp).as_matrix()
-                                                    R_target1 = tuned_grasp[:3, :3]
-                                                    Rz_180 = np.array([[-1.0,0.0,0.0],[0.0,-1.0,0.0],[0.0,0.0,1.0]])
-                                                    R_target2 = R_target1 @ Rz_180
-                                                    if np.trace(R_curr.T @ R_target2) > np.trace(R_curr.T @ R_target1):
-                                                        tuned_grasp[:3, :3] = R_target2
-
-                                                    # 存入顺位池
-                                                    scene_mapper.tuned_grasps_pool.append(tuned_grasp)
-                                                    
-                                                    tilt_angle_deg = np.degrees(np.arccos(saved_tilt))
-                                                    print(f"   👉 Rank #{rank+1} (Original Index: {selected_idx}) -> Perfect Score: {score*100:.1f} | Deviation: {saved_dist*100:.1f}cm | Tilt Angle: {tilt_angle_deg:.1f}°")
-                                                
-                                                # 4. 初始化默认策略：直接挂载顺位第1（索引0）的黄金姿态，重置重试计数器
-                                                scene_mapper.selected_grasp = scene_mapper.tuned_grasps_pool[0]
-                                                scene_mapper.grasp_retry_count = 0  # 🌟 新增：重试计数器归零
-                                                
-                                                scene_mapper.target_box_points = box_points
-                                                #current_hri_state = STATE_GRAB_OBJECT_YOLO 
-                                                current_hri_state = STATE_GRAB_OBJECT
-                                                
-                                                hri_start_time = 0.0
-                                            
-                                            else:
-                                                # 🌟 如果没找到合适姿态，什么数组都不删，直接让他重试！
-                                                print(f"⚠️ [Not Matched] 没有为该物体找到安全的抓取姿态，放弃抓取。请看向其他物体！")
-                                                scene_mapper.selected_grasp = None
-                                                fixation_point = None
-                                                fixation_start_time = time.time()
-                                            
-                                        else:
-                                            print(f"⚠️ [Not Matched] No valid grasp candidates found for the selected box {box_id}. Please try again.")
-                                            scene_mapper.selected_grasp = None
+                                        is_confirmed = True
+                                
                                 else:
                                     fixation_point = current_pt
                                     fixation_start_time = time.time()
+
+                                if is_confirmed:    
+                                    if hasattr(scene_mapper, 'objects_pcd') and not scene_mapper.objects_pcd.is_empty():
+                                        # 🧲 去【纯净盒子地图】里找离当前落点最近的点
+                                        kdtree = o3d.geometry.KDTreeFlann(scene_mapper.objects_pcd)
+                                        _, idx, sq_dist = kdtree.search_knn_vector_3d(fixation_point, 1)
+                                        
+                                        distance_to_box = np.sqrt(sq_dist[0])
+                                        
+                                        # 如果你看的地方方圆 20 厘米内根本没有盒子，说明你在看空桌子，放弃抓取
+                                        if distance_to_box > 0.3:
+                                            print(f"\n ⚠️ [State 4 (Gaze Intersection)]: No boxes found around gaze point, please look at a box! distance to box : {np.round(distance_to_box, 3)}")
+                                            fixation_point = None
+                                            fixation_start_time = time.time()
+                                            continue
+                                            
+                                        # 成功吸附！获取盒子 ID（因为噪点被删了，这里必定是有效盒子）
+                                        box_id = scene_mapper.object_labels[idx[0]]
+                                        
+                                        # =======================================================
+                                        # 🔍【全面诊断补丁】打印所有盒子中心、视线落点及吸附过程
+                                        # =======================================================
+                                        print("\n" + "🔍" * 20)
+                                        print(f"🎯 [State 4 (Gaze Intersection)]: Gaze point in world frame (robot base): {np.round(fixation_point, 3)}")
+                                        print(f"🧲 [State 4 (Gaze Intersection)]: Distance to nearest point from KDTree: {np.round(distance_to_box * 100, 1)} cm")
+                                        
+                                        # 遍历当前场景里所有被分割出来的不同盒子，算出它们各自的中心点
+                                        unique_labels = np.unique(scene_mapper.object_labels)
+                                        print(f"📦 [State 4 (Gaze Intersection)]: Currently detected {len(unique_labels)} objects in the memory map:")
+                                        
+                                        for label in unique_labels:
+                                            # 提取这个标签对应的所有点
+                                            lbl_indices = np.where(scene_mapper.object_labels == label)[0]
+                                            lbl_points = np.asarray(scene_mapper.objects_pcd.points)[lbl_indices]
+                                            
+                                            # 粗略算一下这个盒子的中心（这里用 mean 快速计算用于诊断）
+                                            lbl_center = np.mean(lbl_points, axis=0)
+                                            
+                                            # 计算你的眼睛落点到这个盒子中心的距离
+                                            dist_from_gaze = np.linalg.norm(fixation_point - lbl_center)
+                                            
+                                            # 如果这个标签刚好是被吸附的标签，加个醒目的五星标记
+                                            flag = "⭐ [State 4 (Gaze Intersection)]: Target Object" if label == box_id else "  "
+                                            print(f"   {flag} 物体ID {label} -> 几何中心: {np.round(lbl_center, 3)} | 离你视线落点距离: {np.round(dist_from_gaze * 100, 1)} cm")
+                                        print("🔍" * 20 + "\n")
+                                        # =======================================================
+
+                                        # 📦 提取这整个盒子的所有点，计算几何中心
+                                        box_indices = np.where(scene_mapper.object_labels == box_id)[0]
+                                        box_points = np.asarray(scene_mapper.objects_pcd.points)[box_indices]
+
+                                        # 1. 将 numpy 数组转为 Open3D 点云对象
+                                        single_box_pcd = o3d.geometry.PointCloud()
+                                        single_box_pcd.points = o3d.utility.Vector3dVector(box_points)
+
+                                        # 2. 计算有向包围盒 (OBB)
+                                        obb = single_box_pcd.get_oriented_bounding_box()
+
+                                        # # =======================================================
+                                        # # 🌟【修改 2】残影消除：把这个盒子从全局记忆地图中抹除！
+                                        # # =======================================================
+                                        # # 稍微放大一下 OBB (比如 1.2 倍)，确保边缘和底部的噪点也能被包裹进去
+                                        # eraser_obb = o3d.geometry.OrientedBoundingBox(obb)
+                                        # eraser_obb.scale(1.2, eraser_obb.center)
+                                        
+                                        # # 获取全局地图中，落在这个“橡皮擦盒子”里的所有点的索引
+                                        # ghost_indices = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.global_pcd.points)
+                                        
+                                        # # 使用 invert=True 进行反向提取，相当于把这些点“抠除”
+                                        # scene_mapper.global_pcd = scene_mapper.global_pcd.select_by_index(ghost_indices, invert=True)
+                                        
+                                        # # 同步把这个物体从“磁铁”点云中剔除，防止接下来发生重复吸附
+                                        # ghost_indices_obj = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.objects_pcd.points)
+                                        # scene_mapper.objects_pcd = scene_mapper.objects_pcd.select_by_index(ghost_indices_obj, invert=True)
+                                        
+                                        # print(f"🧹 [State 4 (Gaze Intersection)]: Successfully removed ghost points of box {box_id} from the global point cloud map!")
+                                        # # =======================================================
+
+                                        # 3. 获取真正的几何中心 (这比 np.mean 准得多！)
+                                        box_center = obb.center
+
+                                        # 4. 获取盒子的长宽高尺寸 (用于决定夹爪张开多大)
+                                        box_size = obb.extent 
+                                        print(f"📦 [State 4 (Gaze Intersection)]: Box dimensions: {np.round(box_size, 3)} meters")
+
+                                        # 5. 获取盒子的旋转矩阵 (用于对齐夹爪姿态！)
+                                        box_rotation = obb.R
+                                        
+                                        print(f"\n 🎉 [State 4 (Gaze Intersection)]: Target Box {box_id}")
+                                        print(f" 🎯 Box Geometry Center: {np.round(box_center, 3)}")
+                                        
+
+                                    #    
+                                    # =======================================================
+                                    # 🪐【重构筛选】多目标优选 —— 提取前3名顺位黄金抓取姿态
+                                    # =======================================================
+                                    if hasattr(scene_mapper, 'ai_grasps') and scene_mapper.ai_grasps is not None and len(scene_mapper.ai_grasps) > 0:
+                                        CANDIDATE_POOL_LIMIT = 200 
+                                        candidates_scored = [] # 新增：用于存放所有合法姿态的临时列表
+                                        
+                                        # 1. 第一轮过滤与双标大评分
+                                        for idx_g, grasp_matrix in enumerate(scene_mapper.ai_grasps[:CANDIDATE_POOL_LIMIT]):
+                                            grasp_xyz = grasp_matrix[:3, 3]
+                                            approach_vector = grasp_matrix[:3, 2] 
+                                            
+                                            # A. 计算探针距离
+                                            PROJECTION_DEPTH = 0.15 
+                                            projected_xyz = grasp_xyz + PROJECTION_DEPTH * approach_vector
+                                            dist_to_center = np.linalg.norm(projected_xyz - box_center)
+                                            if dist_to_center > 0.15: continue
+                                                
+                                            # B. 计算倾斜垂直度
+                                            downward_vector = np.array([0.0, 0.0, -1.0])
+                                            tilt_alignment = np.dot(approach_vector, downward_vector)
+                                            tilt_alignment = np.clip(tilt_alignment, -1.0, 1.0)
+                                            if tilt_alignment < 0.64: continue
+                                                
+                                            # C. 综合评分并塞入池中
+                                            distance_score = 1.0 - (dist_to_center / 0.15)
+                                            combined_score = 0.6 * distance_score + 0.4 * tilt_alignment
+                                            
+                                            candidates_scored.append((combined_score, grasp_matrix, dist_to_center, tilt_alignment, idx_g))
+
+                                        # 2. 第二轮：按照得分从高到低强行排序，并斩取前 3 名
+                                        candidates_scored.sort(key=lambda x: x[0], reverse=True)
+                                        top_3_candidates = candidates_scored[:3]
+                                        
+                                        if len(top_3_candidates) > 0:
+
+                                            eraser_obb = o3d.geometry.OrientedBoundingBox(obb)
+                                            eraser_obb.scale(1.2, eraser_obb.center)
+                                            
+                                            # 1. 删 Global Map
+                                            ghost_indices = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.global_pcd.points)
+                                            scene_mapper.global_pcd = scene_mapper.global_pcd.select_by_index(ghost_indices, invert=True)
+                                            
+                                            # 2. 删 Object Map
+                                            ghost_indices_obj = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.objects_pcd.points)
+                                            ghost_indices_np = np.asarray(ghost_indices_obj) # 必须转为 numpy
+                                            
+                                            # 3. 🌟 绝对同步删 Labels (必须在更新 objects_pcd 之前做！)
+                                            mask = np.ones(len(scene_mapper.object_labels), dtype=bool)
+                                            mask[ghost_indices_np] = False
+                                            scene_mapper.object_labels = scene_mapper.object_labels[mask]
+                                            
+                                            # 4. 最后更新 objects_pcd，保证 1:1 对齐
+                                            scene_mapper.objects_pcd = scene_mapper.objects_pcd.select_by_index(ghost_indices_obj, invert=True)
+
+                                            print(f"🧹 顺位筛选通过！已从记忆地图中抹除该物品的残影。")
+
+                                            scene_mapper.tuned_grasps_pool = [] # 🌟 新增：存放微调后的前3顺位矩阵池
+                                            
+                                            print(f"\n🎯 [多目标筛选] 针对当前目标成功锁定 {len(top_3_candidates)} 个顺位备份姿态:")
+                                            
+                                            # 3. 统一对前3名进行局部微调运算
+                                            for rank, (score, selected_grasp, saved_dist, saved_tilt, selected_idx) in enumerate(top_3_candidates):
+                                                # 注入 45 度自转
+                                                Rz_45 = np.array([
+                                                    [ 0.7071,  0.7071,  0.0,  0.0],
+                                                    [-0.7071,  0.7071,  0.0,  0.0],
+                                                    [ 0.0,     0.0,     1.0,  0.0],
+                                                    [ 0.0,     0.0,     0.0,  1.0]
+                                                ])
+                                                tuned_grasp = selected_grasp @ Rz_45
+                                                
+                                                # 注入 7 厘米深插下探
+                                                local_advance = np.eye(4)
+                                                local_advance[2, 3] = 0.0 
+                                                tuned_grasp = tuned_grasp @ local_advance
+                                                
+                                                # 180° 抄近道对称性优化
+                                                ee_pos_temp, ee_quat_temp = robot_listener.get_current_pose()
+                                                from scipy.spatial.transform import Rotation as Rot
+                                                R_curr = Rot.from_quat(ee_quat_temp).as_matrix()
+                                                R_target1 = tuned_grasp[:3, :3]
+                                                Rz_180 = np.array([[-1.0,0.0,0.0],[0.0,-1.0,0.0],[0.0,0.0,1.0]])
+                                                R_target2 = R_target1 @ Rz_180
+                                                if np.trace(R_curr.T @ R_target2) > np.trace(R_curr.T @ R_target1):
+                                                    tuned_grasp[:3, :3] = R_target2
+
+                                                # 存入顺位池
+                                                scene_mapper.tuned_grasps_pool.append(tuned_grasp)
+                                                
+                                                tilt_angle_deg = np.degrees(np.arccos(saved_tilt))
+                                                print(f"   👉 Rank #{rank+1} (Original Index: {selected_idx}) -> Perfect Score: {score*100:.1f} | Deviation: {saved_dist*100:.1f}cm | Tilt Angle: {tilt_angle_deg:.1f}°")
+                                            
+                                            # 4. 初始化默认策略：直接挂载顺位第1（索引0）的黄金姿态，重置重试计数器
+                                            scene_mapper.selected_grasp = scene_mapper.tuned_grasps_pool[0]
+                                            scene_mapper.grasp_retry_count = 0  # 🌟 新增：重试计数器归零
+                                            
+                                            scene_mapper.target_box_points = box_points
+                                            #current_hri_state = STATE_GRAB_OBJECT_YOLO 
+                                            current_hri_state = STATE_GRAB_OBJECT
+                                            
+                                            hri_start_time = 0.0
+                                            is_confirmed = False
+                                            instant_select_flag = False
+                                        
+                                        else:
+                                            # 🌟 如果没找到合适姿态，什么数组都不删，直接让他重试！
+                                            print(f"⚠️ [Not Matched] 没有为该物体找到安全的抓取姿态，放弃抓取。请看向其他物体！")
+                                            scene_mapper.selected_grasp = None
+                                            fixation_point = None
+                                            fixation_start_time = time.time()
+                                        
+                                    else:
+                                        print(f"⚠️ [Not Matched] No valid grasp candidates found for the selected box {box_id}. Please try again.")
+                                        scene_mapper.selected_grasp = None
+                                
                         else:
                             fixation_point = None
                             fixation_start_time = 0.0
@@ -2104,7 +2149,7 @@ def main():
                             
                             # 二次硬对齐检查：手腕角度必须锁死到目标悬停姿态
                             target_quat = scene_mapper.hover_pose[3:7]
-                            is_rotation_ok = robot.is_rotation_reached(target_quat, tolerance_deg=1.5)
+                            is_rotation_ok = robot.is_rotation_reached(target_quat, tolerance_deg=5.0)
                             
                             if is_robot_idle and is_rotation_ok:
                                 if robot is not None:
