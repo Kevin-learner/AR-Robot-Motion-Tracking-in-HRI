@@ -2016,7 +2016,7 @@ def main():
                                             
                                             # 2. 删 Object Map
                                             ghost_indices_obj = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.objects_pcd.points)
-                                            ghost_indices_np = np.asarray(ghost_indices_obj) # 必须转为 numpy
+                                            ghost_indices_np = np.asarray(ghost_indices_obj, dtype=np.int64)
                                             
                                             # 3. 🌟 绝对同步删 Labels (必须在更新 objects_pcd 之前做！)
                                             mask = np.ones(len(scene_mapper.object_labels), dtype=bool)
@@ -2169,7 +2169,7 @@ def main():
                         elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 3.0 and is_robot_idle:
                             print("   -> ✊ Step 3: Contacting the target, closing the gripper...")
                             if robot is not None:
-                                robot.close_gripper(force=20.0, speed=0.05) 
+                                robot.close_gripper(force=25.0, speed=0.05) 
                             
                             scene_mapper.grasp_step = 3
                             hri_start_time = time.time()
@@ -2532,8 +2532,10 @@ def main():
                             # 🌟 新增：在开启伺服的瞬间，记录当前的空载(带物品)基准力
                             try:
                                 scene_mapper.tracking_baseline_fz = robot.get_wrench()[2]
+                                scene_mapper.tracking_baseline_fx = robot.get_wrench()[0]
                             except:
                                 scene_mapper.tracking_baseline_fz = 0.0
+                                scene_mapper.tracking_baseline_fx = 0.0
 
                         hri_start_time = time.time()
                         handover_dwell_start = 0.0
@@ -2547,14 +2549,17 @@ def main():
 
                         # 🌟🌟🌟 在伺服追踪过程中，高频检测是否有用户“提前拿取/拉拽”
                         early_grab_triggered = False
-                        if robot is not None and hasattr(scene_mapper, 'tracking_baseline_fz'):
+                        if robot is not None and (hasattr(scene_mapper, 'tracking_baseline_fz') or hasattr(scene_mapper, 'tracking_baseline_fx')):
                             try:
                                 current_fz = robot.get_wrench()[2]
                                 delta_fz = abs(current_fz - scene_mapper.tracking_baseline_fz)
                                 
+                                current_fx = robot.get_wrench()[0]
+                                delta_fx = abs(current_fz - scene_mapper.tracking_baseline_fx)
+
                                 # 因为伺服运动伴随加减速惯性，阈值需稍大于匀速阶段 (比如 5.0N - 6.0N)
-                                EARLY_FORCE_THRESHOLD = 5.5 
-                                if delta_fz > EARLY_FORCE_THRESHOLD:
+                                EARLY_FORCE_THRESHOLD = 6 
+                                if delta_fz > EARLY_FORCE_THRESHOLD or delta_fx > EARLY_FORCE_THRESHOLD :
                                     print(f"\n⚡ [HRI] Early interaction detected! (ΔFz={delta_fz:.2f}N). User is pulling the object!")
                                     early_grab_triggered = True
                             except Exception:
