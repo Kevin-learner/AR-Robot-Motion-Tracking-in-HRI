@@ -2045,7 +2045,7 @@ def main():
                                                 
                                                 # 注入 7 厘米深插下探
                                                 local_advance = np.eye(4)
-                                                local_advance[2, 3] = 0.0 
+                                                local_advance[2, 3] = 0.015 
                                                 tuned_grasp = tuned_grasp @ local_advance
                                                 
                                                 # 180° 抄近道对称性优化
