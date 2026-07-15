@@ -2028,23 +2028,23 @@ def main():
                                             eraser_obb.scale(1.2, eraser_obb.center)
                                             
                                             # Disabled at Experiment 1------------------------------
-                                            # 1. 删 Global Map
-                                            ghost_indices = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.global_pcd.points)
-                                            scene_mapper.global_pcd = scene_mapper.global_pcd.select_by_index(ghost_indices, invert=True)
+                                            # # 1. 删 Global Map
+                                            # ghost_indices = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.global_pcd.points)
+                                            # scene_mapper.global_pcd = scene_mapper.global_pcd.select_by_index(ghost_indices, invert=True)
                                             
-                                            # 2. 删 Object Map
-                                            ghost_indices_obj = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.objects_pcd.points)
-                                            ghost_indices_np = np.asarray(ghost_indices_obj, dtype=np.int64)
+                                            # # 2. 删 Object Map
+                                            # ghost_indices_obj = eraser_obb.get_point_indices_within_bounding_box(scene_mapper.objects_pcd.points)
+                                            # ghost_indices_np = np.asarray(ghost_indices_obj, dtype=np.int64)
                                             
-                                            # 3. 🌟 绝对同步删 Labels (必须在更新 objects_pcd 之前做！)
-                                            mask = np.ones(len(scene_mapper.object_labels), dtype=bool)
-                                            mask[ghost_indices_np] = False
-                                            scene_mapper.object_labels = scene_mapper.object_labels[mask]
+                                            # # 3. 🌟 绝对同步删 Labels (必须在更新 objects_pcd 之前做！)
+                                            # mask = np.ones(len(scene_mapper.object_labels), dtype=bool)
+                                            # mask[ghost_indices_np] = False
+                                            # scene_mapper.object_labels = scene_mapper.object_labels[mask]
                                             
-                                            # 4. 最后更新 objects_pcd，保证 1:1 对齐
-                                            scene_mapper.objects_pcd = scene_mapper.objects_pcd.select_by_index(ghost_indices_obj, invert=True)
+                                            # # 4. 最后更新 objects_pcd，保证 1:1 对齐
+                                            # scene_mapper.objects_pcd = scene_mapper.objects_pcd.select_by_index(ghost_indices_obj, invert=True)
 
-                                            print(f"🧹 顺位筛选通过！已从记忆地图中抹除该物品的残影。")
+                                            # print(f"🧹 顺位筛选通过！已从记忆地图中抹除该物品的残影。")
                                             #------------------------------------------------------------
 
                                             scene_mapper.tuned_grasps_pool = [] # 🌟 新增：存放微调后的前3顺位矩阵池
@@ -2089,44 +2089,44 @@ def main():
                                             
                                             scene_mapper.target_box_points = box_points
                                             
-                                            # # =======================================================
-                                            # # 🌟 新增：在确定坐标后，立刻计算悬停点并发送全息路线
-                                            # # =======================================================
-                                            # HOVER_BACK_DIST = 0.00
-                                            # local_retreat = np.eye(4)
-                                            # local_retreat[2, 3] = -HOVER_BACK_DIST
+                                            # =======================================================
+                                            # 🌟 新增：在确定坐标后，立刻计算悬停点并发送全息路线
+                                            # =======================================================
+                                            HOVER_BACK_DIST = 0.00
+                                            local_retreat = np.eye(4)
+                                            local_retreat[2, 3] = -HOVER_BACK_DIST
                                             
-                                            # hover_matrix = scene_mapper.selected_grasp @ local_retreat
-                                            # hover_x, hover_y, hover_z = hover_matrix[:3, 3]
+                                            hover_matrix = scene_mapper.selected_grasp @ local_retreat
+                                            hover_x, hover_y, hover_z = hover_matrix[:3, 3]
                                             
-                                            # curr_p, _ = robot_listener.get_current_pose()
-                                            # if curr_p is not None and T_M is not None:
-                                            #     visual_path = []
-                                            #     num_visual_points = 2
-                                            #     start_pt = np.array(curr_p)
-                                            #     end_pt = np.array([hover_x, hover_y, hover_z])
+                                            curr_p, _ = robot_listener.get_current_pose()
+                                            if curr_p is not None and T_M is not None:
+                                                visual_path = []
+                                                num_visual_points = 2
+                                                start_pt = np.array(curr_p)
+                                                end_pt = np.array([hover_x, hover_y, hover_z])
                                                 
-                                            #     for i in range(num_visual_points + 1):
-                                            #         ratio = i / float(num_visual_points)
-                                            #         pt = start_pt + ratio * (end_pt - start_pt)
-                                            #         # 若需抛物线可加上这一行：
-                                            #         # pt[2] += 0.08 * 4.0 * ratio * (1.0 - ratio) 
-                                            #         visual_path.append(pt)
+                                                for i in range(num_visual_points + 1):
+                                                    ratio = i / float(num_visual_points)
+                                                    pt = start_pt + ratio * (end_pt - start_pt)
+                                                    # 若需抛物线可加上这一行：
+                                                    # pt[2] += 0.08 * 4.0 * ratio * (1.0 - ratio) 
+                                                    visual_path.append(pt)
                                                     
-                                            #     send_path_to_hololens(conn, visual_path, T_M)
-                                            #     print(f"✨ [HRI 可视化] 物品已确认！已向 HoloLens 发送飞往该物品的预测轨迹！")
+                                                send_path_to_hololens(conn, visual_path, T_M)
+                                                print(f"✨ [HRI 可视化] 物品已确认！已向 HoloLens 发送飞往该物品的预测轨迹！")
 
-                                            # # =======================================================
-                                            # # 🛑 切入预演阶段，而不是直接去状态 5
-                                            # # =======================================================
-                                            # print("   ⏳ [预演模式] 保持全息路线 1.5 秒钟供用户观察...")
-                                            # scene_mapper.gaze_step = 999    # 激活上方的阻断代码
-                                            # hri_start_time = time.time()  # 重置计时器用于 1.5 秒倒数
+                                            # =======================================================
+                                            # 🛑 切入预演阶段，而不是直接去状态 5
+                                            # =======================================================
+                                            print("   ⏳ [预演模式] 保持全息路线 1.5 秒钟供用户观察...")
+                                            scene_mapper.gaze_step = 999    # 激活上方的阻断代码
+                                            hri_start_time = time.time()  # 重置计时器用于 1.5 秒倒数
                                             
                                             #实验2、3取消注释
                                             #current_hri_state = STATE_GRAB_OBJECT_YOLO 
-                                            current_hri_state = STATE_GRAB_OBJECT
-                                            hri_start_time = 0.0
+                                            #current_hri_state = STATE_GRAB_OBJECT
+                                            #hri_start_time = 0.0
 
                                             is_confirmed = False
                                             instant_select_flag = False
