@@ -1807,6 +1807,23 @@ def main():
                         
                     else:
                         scene_mapper.update_window() 
+
+                        # =======================================================
+                        # 🛑 阶段 999：路线预演阻断模式（展示路径 1.5 秒后清除并重置）
+                        # =======================================================
+                        if getattr(scene_mapper, 'gaze_step', 0) == 999:
+                            if time.time() - hri_start_time > 1.5:
+                                print("   🧹 [预演模式] 1.5秒观察结束，清空预测路线并重新开启自由选择！\n" + "="*50)
+                                if T_M is not None:
+                                    send_path_to_hololens(conn, [], T_M) # 发送空数组，清除丝带
+                                
+                                # 重置各类状态，回到阶段 0 允许用户再次选择
+                                scene_mapper.selected_grasp = None
+                                scene_mapper.gaze_step = 0
+                                fixation_point = None
+                                fixation_start_time = time.time()
+                            continue # ⚠️ 非常重要：在预演期间拦截下方的射线求交逻辑
+
                         current_pt = None
                         
                         # 🎯 1. 射线跟【完整大地图（含桌子）】求交！保证红球绝不消失！
@@ -2069,10 +2086,46 @@ def main():
                                             scene_mapper.grasp_retry_count = 0  # 🌟 新增：重试计数器归零
                                             
                                             scene_mapper.target_box_points = box_points
-                                            #current_hri_state = STATE_GRAB_OBJECT_YOLO 
-                                            current_hri_state = STATE_GRAB_OBJECT
                                             
-                                            hri_start_time = 0.0
+                                            # =======================================================
+                                            # 🌟 新增：在确定坐标后，立刻计算悬停点并发送全息路线
+                                            # =======================================================
+                                            HOVER_BACK_DIST = 0.15
+                                            local_retreat = np.eye(4)
+                                            local_retreat[2, 3] = -HOVER_BACK_DIST
+                                            
+                                            hover_matrix = scene_mapper.selected_grasp @ local_retreat
+                                            hover_x, hover_y, hover_z = hover_matrix[:3, 3]
+                                            
+                                            curr_p, _ = robot_listener.get_current_pose()
+                                            if curr_p is not None and T_M is not None:
+                                                visual_path = []
+                                                num_visual_points = 2
+                                                start_pt = np.array(curr_p)
+                                                end_pt = np.array([hover_x, hover_y, hover_z])
+                                                
+                                                for i in range(num_visual_points + 1):
+                                                    ratio = i / float(num_visual_points)
+                                                    pt = start_pt + ratio * (end_pt - start_pt)
+                                                    # 若需抛物线可加上这一行：
+                                                    # pt[2] += 0.08 * 4.0 * ratio * (1.0 - ratio) 
+                                                    visual_path.append(pt)
+                                                    
+                                                send_path_to_hololens(conn, visual_path, T_M)
+                                                print(f"✨ [HRI 可视化] 物品已确认！已向 HoloLens 发送飞往该物品的预测轨迹！")
+
+                                            # =======================================================
+                                            # 🛑 切入预演阶段，而不是直接去状态 5
+                                            # =======================================================
+                                            print("   ⏳ [预演模式] 保持全息路线 1.5 秒钟供用户观察...")
+                                            scene_mapper.gaze_step = 999    # 激活上方的阻断代码
+                                            hri_start_time = time.time()  # 重置计时器用于 1.5 秒倒数
+                                            
+                                            #实验2、3取消注释
+                                            #current_hri_state = STATE_GRAB_OBJECT_YOLO 
+                                            #current_hri_state = STATE_GRAB_OBJECT
+                                            #hri_start_time = 0.0
+
                                             is_confirmed = False
                                             instant_select_flag = False
                                         
