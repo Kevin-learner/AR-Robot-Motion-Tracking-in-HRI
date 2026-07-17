@@ -2613,10 +2613,12 @@ def main():
                                 delta_fx = abs(current_fz - scene_mapper.tracking_baseline_fx)
 
                                 # 因为伺服运动伴随加减速惯性，阈值需稍大于匀速阶段 (比如 5.0N - 6.0N)
-                                EARLY_FORCE_THRESHOLD = 6 
-                                if delta_fz > EARLY_FORCE_THRESHOLD or delta_fx > EARLY_FORCE_THRESHOLD :
-                                    print(f"\n⚡ [HRI] Early interaction detected! (ΔFz={delta_fz:.2f}N). User is pulling the object!")
-                                    early_grab_triggered = True
+                                EARLY_FORCE_THRESHOLD_Z = 7 
+                                EARLY_FORCE_THRESHOLD_X = 16
+                                if delta_fz != 0:
+                                    if delta_fz > EARLY_FORCE_THRESHOLD_Z or delta_fx > EARLY_FORCE_THRESHOLD_X :
+                                        print(f"\n⚡ [HRI] Early interaction detected! (ΔFz={delta_fz:.2f}N)(ΔFx={delta_fx:.2f}N). User is pulling the object!")
+                                        early_grab_triggered = True
                             except Exception:
                                 pass
                                 
