@@ -1913,34 +1913,40 @@ def main():
                                             
                                         # 成功吸附！获取盒子 ID（因为噪点被删了，这里必定是有效盒子）
                                         box_id = scene_mapper.object_labels[idx[0]]
+                                        # 提取当前时间并格式化，带上毫秒 (例如 14:30:25.123)
+                                        t_now = time.time()
+                                        ms = int((t_now % 1) * 1000)
+                                        time_str = time.strftime("%H:%M:%S", time.localtime(t_now))
                                         
-                                        # =======================================================
-                                        # 🔍【全面诊断补丁】打印所有盒子中心、视线落点及吸附过程
-                                        # =======================================================
-                                        print("\n" + "🔍" * 20)
-                                        print(f"🎯 [State 4 (Gaze Intersection)]: Gaze point in world frame (robot base): {np.round(fixation_point, 3)}")
-                                        print(f"🧲 [State 4 (Gaze Intersection)]: Distance to nearest point from KDTree: {np.round(distance_to_box * 100, 1)} cm")
+                                        print(f"🧲 [{time_str}.{ms:03d}] [State 4]: Successfully locked onto Object {box_id}!")
+                                       
+                                        # # =======================================================
+                                        # # 🔍【全面诊断补丁】打印所有盒子中心、视线落点及吸附过程
+                                        # # =======================================================
+                                        # # print("\n" + "🔍" * 20)
+                                        # # print(f"🎯 [State 4 (Gaze Intersection)]: Gaze point in world frame (robot base): {np.round(fixation_point, 3)}")
+                                        # # print(f"🧲 [State 4 (Gaze Intersection)]: Distance to nearest point from KDTree: {np.round(distance_to_box * 100, 1)} cm")
                                         
-                                        # 遍历当前场景里所有被分割出来的不同盒子，算出它们各自的中心点
-                                        unique_labels = np.unique(scene_mapper.object_labels)
-                                        print(f"📦 [State 4 (Gaze Intersection)]: Currently detected {len(unique_labels)} objects in the memory map:")
+                                        # # 遍历当前场景里所有被分割出来的不同盒子，算出它们各自的中心点
+                                        # unique_labels = np.unique(scene_mapper.object_labels)
+                                        # print(f"📦 [State 4 (Gaze Intersection)]: Currently detected {len(unique_labels)} objects in the memory map:")
                                         
-                                        for label in unique_labels:
-                                            # 提取这个标签对应的所有点
-                                            lbl_indices = np.where(scene_mapper.object_labels == label)[0]
-                                            lbl_points = np.asarray(scene_mapper.objects_pcd.points)[lbl_indices]
+                                        # for label in unique_labels:
+                                        #     # 提取这个标签对应的所有点
+                                        #     lbl_indices = np.where(scene_mapper.object_labels == label)[0]
+                                        #     lbl_points = np.asarray(scene_mapper.objects_pcd.points)[lbl_indices]
                                             
-                                            # 粗略算一下这个盒子的中心（这里用 mean 快速计算用于诊断）
-                                            lbl_center = np.mean(lbl_points, axis=0)
+                                        #     # 粗略算一下这个盒子的中心（这里用 mean 快速计算用于诊断）
+                                        #     lbl_center = np.mean(lbl_points, axis=0)
                                             
-                                            # 计算你的眼睛落点到这个盒子中心的距离
-                                            dist_from_gaze = np.linalg.norm(fixation_point - lbl_center)
+                                        #     # 计算你的眼睛落点到这个盒子中心的距离
+                                        #     dist_from_gaze = np.linalg.norm(fixation_point - lbl_center)
                                             
-                                            # 如果这个标签刚好是被吸附的标签，加个醒目的五星标记
-                                            flag = "⭐ [State 4 (Gaze Intersection)]: Target Object" if label == box_id else "  "
-                                            print(f"   {flag} 物体ID {label} -> 几何中心: {np.round(lbl_center, 3)} | 离你视线落点距离: {np.round(dist_from_gaze * 100, 1)} cm")
-                                        print("🔍" * 20 + "\n")
-                                        # =======================================================
+                                        #     # 如果这个标签刚好是被吸附的标签，加个醒目的五星标记
+                                        #     flag = "⭐ [State 4 (Gaze Intersection)]: Target Object" if label == box_id else "  "
+                                        #     print(f"   {flag} 物体ID {label} -> 几何中心: {np.round(lbl_center, 3)} | 离你视线落点距离: {np.round(dist_from_gaze * 100, 1)} cm")
+                                        # print("🔍" * 20 + "\n")
+                                        # # =======================================================
 
                                         # 📦 提取这整个盒子的所有点，计算几何中心
                                         box_indices = np.where(scene_mapper.object_labels == box_id)[0]

@@ -2189,7 +2189,7 @@ def main():
                         # 3. 立刻派发第一阶段：飞往斜上方悬停点
                         print("   -> 🛫 Step 1: Flying to the oblique axis hover point...")
                         if robot is not None:
-                            robot.move_to(scene_mapper.hover_pose, speed=0.06) 
+                            robot.move_to(scene_mapper.hover_pose, speed=0.10) 
                             
                         scene_mapper.grasp_step = 1       
                         hri_start_time = time.time()
@@ -2224,7 +2224,7 @@ def main():
                         elif getattr(scene_mapper, 'grasp_step', 0) == 2 and time.time() - hri_start_time > 3.0 and is_robot_idle:
                             print("   -> ✊ Step 3: Contacting the target, closing the gripper...")
                             if robot is not None:
-                                robot.close_gripper(force=25.0, speed=0.05) 
+                                robot.close_gripper(force=25.0, speed=0.08) 
                             
                             scene_mapper.grasp_step = 3
                             hri_start_time = time.time()
@@ -2240,7 +2240,7 @@ def main():
                             if curr_p is not None:
                                 scene_mapper.lift_pose = [curr_p[0], curr_p[1], curr_p[2] + 0.18] + curr_r.tolist()
                                 if robot is not None:
-                                    robot.move_to(scene_mapper.lift_pose, speed=0.06) 
+                                    robot.move_to(scene_mapper.lift_pose, speed=0.10) 
                                     
                             scene_mapper.grasp_step = 4
                             hri_start_time = time.time()
@@ -2449,7 +2449,7 @@ def main():
                                     curr_p, curr_r = robot_listener.get_current_pose()
                                     if curr_p is not None:
                                         lift_pose = [curr_p[0], curr_p[1], curr_p[2] + 0.20] + curr_r.tolist()
-                                        robot.move_to(lift_pose, speed=0.08)
+                                        robot.move_to(lift_pose, speed=0.10)
                                 
                                 print("🎉 [YOLO Grasp] Blind grasp complete! Moving to delivery state...")
                                 current_hri_state = STATE_LOOKING_FOR_USER
