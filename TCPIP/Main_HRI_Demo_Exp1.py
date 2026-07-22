@@ -657,7 +657,7 @@ def main():
     last_synced_sub_state = -999
     
     # 定义机械臂初始观测位姿 (请替换为你实际的关节角或笛卡尔坐标)
-    INIT_POSE = [0.3572, 0.0073, 0.5586, -0.68, 0.27, -0.63, 0.26]    # 1. State Tracking 的 PID 参数 (需要调试)
+    INIT_POSE = [0.3572, 0.0073, 0.5086, -0.68, 0.27, -0.63, 0.26]    # 1. State Tracking 的 PID 参数 (需要调试)
     KP_X = 0.5 
     KP_Y = 0.5
     DEADZONE_M = 0.05 # 5cm死区，人在画面中心 5cm 内机械臂不动
@@ -678,8 +678,8 @@ def main():
     # ====== Multipointcloud test ======
     # 这里使用的是 [x, y, z, qx, qy, qz, qw] 或关节角，只要符合你的 robot.move_to 格式即可
 
-    SCAN_START_POSE = [0.5000, 0.2700, 0.5, 0.91, -0.42, 0.04, -0.02]
-    SCAN_END_POSE   = [0.5000, -0.1800, 0.5, -0.92, 0.38, -0.04, -0.01] #[INFO] [1777634168.026776]: sent #149 UPDATED d=0.000223 xyz=(0.5621, -0.1739, 0.5610) Euler[Deg]=(Rx:-179.5, Ry:-4.6, Rz:-45.0) q=(-0.92, 0.38, -0.04, -0.01)
+    SCAN_START_POSE = [0.4600, 0.2700, 0.5, 0.91, -0.42, 0.04, -0.02]
+    SCAN_END_POSE   = [0.4600, -0.1800, 0.5, -0.92, 0.38, -0.04, -0.01] #[INFO] [1777634168.026776]: sent #149 UPDATED d=0.000223 xyz=(0.5621, -0.1739, 0.5610) Euler[Deg]=(Rx:-179.5, Ry:-4.6, Rz:-45.0) q=(-0.92, 0.38, -0.04, -0.01)
     SCAN_STEPS = 6  # 直线上拍 4 张照片（起点、2个中间点、终点）
 
     SCAN_ARC_HEIGHT = 0.04
@@ -1622,7 +1622,7 @@ def main():
                                         scan_current_step += 1
                                         if scan_current_step < SCAN_STEPS:
                                             if robot is not None:
-                                                robot.move_to(scan_waypoints[scan_current_step], speed=0.05)
+                                                robot.move_to(scan_waypoints[scan_current_step], speed=0.08)
                                         last_capture_time = 0.0
 
                                         

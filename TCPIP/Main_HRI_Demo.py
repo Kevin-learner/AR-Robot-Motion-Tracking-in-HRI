@@ -678,8 +678,8 @@ def main():
     # ====== Multipointcloud test ======
     # 这里使用的是 [x, y, z, qx, qy, qz, qw] 或关节角，只要符合你的 robot.move_to 格式即可
 
-    SCAN_START_POSE = [0.5000, 0.2700, 0.5, 0.91, -0.42, 0.04, -0.02]
-    SCAN_END_POSE   = [0.5000, -0.1800, 0.5, -0.92, 0.38, -0.04, -0.01] #[INFO] [1777634168.026776]: sent #149 UPDATED d=0.000223 xyz=(0.5621, -0.1739, 0.5610) Euler[Deg]=(Rx:-179.5, Ry:-4.6, Rz:-45.0) q=(-0.92, 0.38, -0.04, -0.01)
+    SCAN_START_POSE = [0.4600, 0.2700, 0.5, 0.91, -0.42, 0.04, -0.02]
+    SCAN_END_POSE   = [0.4600, -0.1800, 0.5, -0.92, 0.38, -0.04, -0.01] #[INFO] [1777634168.026776]: sent #149 UPDATED d=0.000223 xyz=(0.5621, -0.1739, 0.5610) Euler[Deg]=(Rx:-179.5, Ry:-4.6, Rz:-45.0) q=(-0.92, 0.38, -0.04, -0.01)
     SCAN_STEPS = 6  # 直线上拍 4 张照片（起点、2个中间点、终点）
 
     SCAN_ARC_HEIGHT = 0.04
@@ -2229,6 +2229,7 @@ def main():
                             scene_mapper.grasp_step = 3
                             hri_start_time = time.time()
                             
+
                         # -----------------------------------
                         # 阶段 4：抓稳后垂直向上提拉，退出障碍区 (你缺失的提拉部分)
                         # -----------------------------------
@@ -2240,7 +2241,7 @@ def main():
                             if curr_p is not None:
                                 scene_mapper.lift_pose = [curr_p[0], curr_p[1], curr_p[2] + 0.18] + curr_r.tolist()
                                 if robot is not None:
-                                    robot.move_to(scene_mapper.lift_pose, speed=0.10) 
+                                    robot.move_to(scene_mapper.lift_pose, speed=0.08) 
                                     
                             scene_mapper.grasp_step = 4
                             hri_start_time = time.time()
@@ -2613,7 +2614,7 @@ def main():
                                 delta_fx = abs(current_fz - scene_mapper.tracking_baseline_fx)
 
                                 # 因为伺服运动伴随加减速惯性，阈值需稍大于匀速阶段 (比如 5.0N - 6.0N)
-                                EARLY_FORCE_THRESHOLD_Z = 7 
+                                EARLY_FORCE_THRESHOLD_Z = 10 
                                 EARLY_FORCE_THRESHOLD_X = 16
                                 if delta_fz != 0:
                                     if delta_fz > EARLY_FORCE_THRESHOLD_Z or delta_fx > EARLY_FORCE_THRESHOLD_X :
