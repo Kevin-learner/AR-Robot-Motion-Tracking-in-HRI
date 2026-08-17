@@ -1635,15 +1635,21 @@ def main():
                                 # ---------------------------------------------------------
                                 if getattr(scene_mapper, 'scan_post_process', 0) == 0:
                                     print("\n🎉 State 3 (Scanning Objects): Starting processing/refreshing point cloud map data...")
+    
+                                    # [新增] 自动创建存储目录
+                                    os.makedirs("debug_pcds", exist_ok=True)
                                     
                                     final_pcd = scene_mapper.global_pcd
-                                    
                                     if final_pcd is None or len(final_pcd.points) < 50:
                                         print("⚠️ State 3 (Scanning Objects): Table is empty! Automatically switching back to idle state...")
                                         current_hri_state = STATE_IDLE
                                         hri_start_time = 0.0
                                         scene_mapper.scan_post_process = 0
                                         continue
+
+                                    # ================= 阶段 1：原始整体点云 =================
+                                    o3d.io.write_point_cloud("debug_pcds/01_raw_global_scene.pcd", final_pcd)
+                                    print("   💾 [导出] 01_raw_global_scene.pcd (未裁剪原始点云)")
 
                                     print("   ✂️ State 3 (Scanning Objects): 0. Performing Z axis cropping...")
                                     points = np.asarray(final_pcd.points)
@@ -1653,7 +1659,7 @@ def main():
                                     print("   🧹 State 3 (Scanning Objects): 1. Performing statistical filtering...")
                                     cleaned_pcd, _ = final_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=3.0)
 
-                                    # 🌟【核心】：在这里进行初始的全局偏置
+                                    # 全局 Z 轴偏置
                                     print(f"   📐 State 3: Applying initial global Z offset: {global_z_offset:.4f} m")
                                     cleaned_pcd.translate(np.array([0.0, 0.0, global_z_offset]))
                                     
@@ -1662,7 +1668,12 @@ def main():
                                     scene_mapper.display_pcd.colors = cleaned_pcd.colors
                                     scene_mapper.update_window()
 
+                                    # ================= 阶段 2：滤波与偏置后的全景点云 =================
+                                    o3d.io.write_point_cloud("debug_pcds/02_cleaned_scene.pcd", cleaned_pcd)
+                                    print("   💾 [导出] 02_cleaned_scene.pcd (滤波及Z偏置后点云)")
+
                                     try:
+                                        # 你原本的旧代码逻辑
                                         o3d.io.write_point_cloud("scanned_scene.pcd", cleaned_pcd)
                                         if T_M is not None:
                                             send_point_cloud_to_hololens(conn, cleaned_pcd, T_M)
@@ -1672,9 +1683,18 @@ def main():
                                     # 分割与聚类
                                     print("   🪚 State 3 (Scanning Objects): 2. Identifying table (RANSAC)...")
                                     plane_model, inliers = cleaned_pcd.segment_plane(distance_threshold=0.01, ransac_n=3, num_iterations=1000)
+                                    
+                                    # 提取桌面的点云 与 桌面上的物体点云
+                                    table_pcd = cleaned_pcd.select_by_index(inliers)
                                     objects_pcd = cleaned_pcd.select_by_index(inliers, invert=True)
 
-                                    table_points = np.asarray(cleaned_pcd.select_by_index(inliers).points)
+                                    # ================= 阶段 3：分割出来的桌面与待聚类非桌面点云 =================
+                                    o3d.io.write_point_cloud("debug_pcds/03_table_plane.pcd", table_pcd)
+                                    o3d.io.write_point_cloud("debug_pcds/04_above_table_raw_objects.pcd", objects_pcd)
+                                    print("   💾 [导出] 03_table_plane.pcd (RANSAC提取出的桌子)")
+                                    print("   💾 [导出] 04_above_table_raw_objects.pcd (桌上所有非桌面元素)")
+
+                                    table_points = np.asarray(table_pcd.points)
                                     scene_mapper.table_z = np.mean(table_points[:, 2]) 
                                     
                                     print("   📦 State 3 (Scanning Objects): 3. Clustering remaining objects...")
@@ -1695,10 +1715,24 @@ def main():
                                         scene_mapper.display_pcd.colors = clean_objects_pcd.colors
                                         scene_mapper.update_window()
 
+                                        # ================= 阶段 4：带有不同着色的总体聚类点云 =================
+                                        o3d.io.write_point_cloud("debug_pcds/05_all_clustered_objects_colored.pcd", clean_objects_pcd)
+                                        print("   💾 [导出] 05_all_clustered_objects_colored.pcd (已着色的所有有效独立物品)")
+
+                                        # ================= 阶段 5：遍历标签，单独保存每一个被切割的物品 =================
+                                        unique_labels = np.unique(clean_labels)
+                                        for lbl in unique_labels:
+                                            lbl_indices = np.where(clean_labels == lbl)[0]
+                                            single_item_pcd = clean_objects_pcd.select_by_index(lbl_indices)
+                                            
+                                            item_filename = f"debug_pcds/object_id_{lbl:02d}.pcd"
+                                            o3d.io.write_point_cloud(item_filename, single_item_pcd)
+                                        print(f"   💾 [导出] 已将 {len(unique_labels)} 个独立的待抓取物品分别存保存至 debug_pcds/object_id_XX.pcd")
+
                                     scene_mapper.objects_pcd = clean_objects_pcd
                                     scene_mapper.object_labels = clean_labels
                                     print(f"   ✅ State 3 (Scanning Objects): Environment refreshed! {clean_labels.max() + 1 if len(clean_labels)>0 else 0} objects remaining.")
-                                    
+
                                     ee_pos_snap, ee_quat_snap = robot_listener.get_current_pose()
                                     scene_mapper.locked_robot_t_c = camera2unity.get_camera_to_robot_matrix(ee_pos_snap, ee_quat_snap, EE_T_C)
 

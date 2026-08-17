@@ -961,7 +961,12 @@ if __name__ == "__main__":
     import queue
     from global_config import pointcloud_display_queue
 
-    print("🚀 启动极简【纯骨架】显示模式...")
+    print("🚀 启动【3D着色点云 + 3D骨架】显示模式...")
+
+    # 1. 创建窗口并绑定鼠标回调函数，这样你就可以用鼠标拖拽旋转、滚轮缩放 3D 视角了
+    window_name = "3D PointCloud + Skeleton"
+    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(window_name, mouse_cb)
 
     while True:
         T_M = np.array([[1, 0, 0, 0],
@@ -969,7 +974,7 @@ if __name__ == "__main__":
                         [0, 0, -1, 0],
                         [0, 0, 0, 1]])
 
-        # ⚠️ 注意这里：既然要看骨架，我帮你换成了 Body3DSkeletonProcess_dual
+        # 运行处理管线，提取骨架和点云，并将结果送入队列
         send_coords, should_quit = Body3DSkeletonProcess_dual(T_M, use_dual_camera=False)
 
         if should_quit:
@@ -977,33 +982,60 @@ if __name__ == "__main__":
             continue
 
         try:
-            # 1. 从原有的队列中把后台算好的数据拿出来（如果不拿出来，队列满了会卡死）
+            # 2. 从后台队列中拿到计算好的 3D 数据
             data = pointcloud_display_queue.get_nowait()
             
-            # 2. 根据你代码里往队列塞数据的顺序，提取出我们需要的东西
-            color_image_1 = data[9] # 原始画面（仅用来获取尺寸）
-            pose_2d_1 = data[11]    # 2D 骨架关键点位置
+            # 根据你在 Body3DSkeletonProcess_dual 塞入数据的索引提取
+            verts_1 = data[0]          # 3D点云坐标
+            texcoords_1 = data[1]      # 点云纹理坐标
+            colors_1 = data[2]         # 原图颜色
+            intrinsics = data[6]       # 相机内参
+            pose_3d_1 = data[7]        # 3D骨架坐标 (未经T_M变换，适配当前相机视角)
             
-            # 3. 创建一个和原画面一样大的【纯黑背景】
-            black_canvas = np.zeros_like(color_image_1)
+            if intrinsics.width == 0 or intrinsics.height == 0:
+                continue
 
-            # 4. 使用你代码里自带的画图函数，在黑板上画出绿色的点和线
-            if pose_2d_1 is not None and len(pose_2d_1) > 0:
-                draw_pose_2d(black_canvas, pose_2d_1, skeleton_pairs, color=(0, 255, 0), radius=4, thickness=2)
+            frame_h, frame_w = intrinsics.height, intrinsics.width
+            state.window_shape = (frame_h, frame_w)
 
-            # 5. 在主线程安全地显示画面
-            cv2.imshow("Pure Skeleton View", black_canvas)
+            # 3. 创建一块黑板作为 3D 渲染背景
+            out = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+
+            # 画出相机的视锥体和坐标原点轴
+            frustum(out, intrinsics)
+            axes(out, view([0, 0, 0]), state.rotation, size=0.1, thickness=2)
+
+            # 4. 最重要的一步：利用你写好的 pointcloud 函数，同时画出点云和附带的骨架 (verts_extra)
+            if verts_1 is not None and len(verts_1) > 0:
+                pointcloud(out, verts_1, texcoords_1, colors_1,
+                           verts_extra=pose_3d_1,            # 附加要画的 3D 骨架点
+                           color_extra=(0, 255, 0),          # 骨架绘制成绿色
+                           skeleton_pairs=skeleton_pairs,    # 骨架连线规则
+                           radius_extra=4, line_thickness=2) # 节点大小和线宽
+
+            # 鼠标拖拽时，屏幕中心显示粗的辅助坐标轴
+            if any(state.mouse_btns):
+                axes(out, view(state.pivot), state.rotation, thickness=4)
+
+            # 5. 显示渲染完毕的 3D 画面
+            cv2.imshow(window_name, out)
             
-            # 按 Esc 键安全退出
-            if cv2.waitKey(1) == 27: 
+            # 处理按键事件
+            key = cv2.waitKey(1)
+            
+            # Esc 或者直接关掉窗口退出
+            if key == 27 or cv2.getWindowProperty(window_name, cv2.WND_PROP_AUTOSIZE) < 0:
                 print("👋 已手动退出程序。")
                 break
+                
+            # 提供和你原来 main_3DSkeleton_visualizer_loop 一样的快捷键支持
+            if key == ord("r"):
+                print("🔄 视角重置")
+                state.reset()
+            elif key == ord("s"):
+                cv2.imwrite('./out_3D.png', out)
+                print("💾 3D 截图已保存为 out_3D.png")
 
         except queue.Empty:
             # 队列里没数据就跳过，等下一帧
             pass
-
-
-
-
-
