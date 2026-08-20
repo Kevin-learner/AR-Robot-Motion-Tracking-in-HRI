@@ -2132,7 +2132,7 @@ def main():
                                             # =======================================================
                                             # 🌟 新增：在确定坐标后，立刻计算悬停点并发送全息路线
                                             # =======================================================
-                                            HOVER_BACK_DIST = 0.20
+                                            HOVER_BACK_DIST = 0
                                             local_retreat = np.eye(4)
                                             local_retreat[2, 3] = -HOVER_BACK_DIST
                                             
@@ -2148,7 +2148,7 @@ def main():
                                                 
                                                 for i in range(num_visual_points + 1):
                                                     ratio = i / float(num_visual_points)
-                                                    pt = start_pt + ratio * (end_pt - start_pt)
+                                                    pt = start_pt + ratio * (end_pt - start_pt) - np.array([0.0, 0.0, 0.10])
                                                     # 若需抛物线可加上这一行：
                                                     # pt[2] += 0.08 * 4.0 * ratio * (1.0 - ratio) 
                                                     visual_path.append(pt)

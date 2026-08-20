@@ -2685,7 +2685,7 @@ def main():
                                         num_visual_points = 10
                                         for i in range(num_visual_points + 1):
                                             ratio = i / float(num_visual_points)
-                                            pt = np.array(ee_pos) + ratio * vec_to_target
+                                            pt = np.array(ee_pos) + ratio * vec_to_target - np.array([0, 0, 0.10])
                                             full_visual_path.append(pt)
                                         send_path_to_hololens(conn, full_visual_path, T_M)
                                         last_ray_print_time = time.time()
